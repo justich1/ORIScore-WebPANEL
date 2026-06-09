@@ -1,0 +1,579 @@
+<?php
+declare(strict_types=1);
+
+require __DIR__ . '/../_api_boot.php';
+
+$method = strtoupper($_SERVER['REQUEST_METHOD'] ?? 'GET');
+$path = $_SERVER['PATH_INFO'] ?? '';
+if ($path === '') {
+  // fallback bez rewrite: /api/v1/index.php?r=/sites
+  $path = (string)($_GET['r'] ?? '');
+}
+$path = '/' . ltrim($path, '/');
+
+// health
+if ($path === '/health') api_json(200, ['ok'=>true]);
+
+// helpers
+function need_int(string $v): int {
+  if (!ctype_digit($v)) api_json(400, ['ok'=>false,'error'=>'invalid_id']);
+  return (int)$v;
+}
+
+function setting(PDO $pdo, string $k, ?string $def=null): ?string {
+  $st=$pdo->prepare("SELECT v FROM settings WHERE k=?");
+  $st->execute([$k]);
+  $r=$st->fetch();
+  return $r ? (string)$r['v'] : $def;
+}
+
+function normalize_wg_ip(string $ip): string {
+  $ip = trim($ip);
+  if ($ip === '') return '';
+  // allow already with mask
+  if (str_contains($ip, '/')) return $ip;
+  // else add /32 or /128
+  return $ip . (str_contains($ip, ':') ? '/128' : '/32');
+}
+
+function cmd_exists(string $bin): bool {
+  $rc = 1;
+  exec('command -v '.escapeshellarg($bin).' >/dev/null 2>&1', $o, $rc);
+  return $rc === 0;
+}
+
+function wg_generate_keys(): array {
+  if (!cmd_exists('wg')) api_json(500, ['ok'=>false,'error'=>'wg_not_installed']);
+
+  // client private
+  $priv = trim((string)shell_exec("wg genkey 2>/dev/null"));
+  if ($priv === '') api_json(500, ['ok'=>false,'error'=>'wg_genkey_failed']);
+
+  // client public
+  $pub = trim((string)shell_exec("printf %s ".escapeshellarg($priv)." | wg pubkey 2>/dev/null"));
+  if ($pub === '') api_json(500, ['ok'=>false,'error'=>'wg_pubkey_failed']);
+
+  // psk
+  $psk = trim((string)shell_exec("wg genpsk 2>/dev/null"));
+  if ($psk === '') api_json(500, ['ok'=>false,'error'=>'wg_genpsk_failed']);
+
+  return ['private'=>$priv,'public'=>$pub,'preshared'=>$psk];
+}
+
+function wg_build_client_config(PDO $pdo, array $peerRow, string $clientPrivate, string $clientPublic, string $psk): string {
+  $serverPub = (string)setting($pdo, 'wg_server_public_key', '');
+  $endpoint  = (string)setting($pdo, 'wg_endpoint', '');
+  $dns       = (string)setting($pdo, 'wg_dns', '');
+  $allowed   = (string)setting($pdo, 'wg_client_allowed_ips', '0.0.0.0/0, ::/0');
+  $keepalive = (string)setting($pdo, 'wg_keepalive', '25');
+
+  if ($serverPub === '' || $endpoint === '') {
+    api_json(500, ['ok'=>false,'error'=>'wg_missing_server_settings','need'=>['wg_server_public_key','wg_endpoint']]);
+  }
+
+  $name = (string)($peerRow['name'] ?? 'peer');
+  $addr = normalize_wg_ip((string)($peerRow['ip'] ?? ''));
+
+  $lines = [];
+  $lines[] = "# ORIS WireGuard client config";
+  $lines[] = "# peer: ".$name;
+  $lines[] = "";
+  $lines[] = "[Interface]";
+  $lines[] = "PrivateKey = ".$clientPrivate;
+  if ($addr !== '') $lines[] = "Address = ".$addr;
+  if ($dns !== '')  $lines[] = "DNS = ".$dns;
+  $lines[] = "";
+  $lines[] = "[Peer]";
+  $lines[] = "PublicKey = ".$serverPub;
+  if ($psk !== '') $lines[] = "PresharedKey = ".$psk;
+  $lines[] = "AllowedIPs = ".$allowed;
+  $lines[] = "Endpoint = ".$endpoint;
+  if ($keepalive !== '') $lines[] = "PersistentKeepalive = ".$keepalive;
+  $lines[] = "";
+
+  return implode("\n", $lines);
+}
+
+/**
+ * Model “stejně jako admin”:
+ * - API zapíše změny do tabulek (sites/tunnels/ftp_accounts/wg_peers)
+ * - vloží job do `jobs`
+ * - provisioner to udělá a UI to uvidí v Úlohách
+ */
+
+//
+// SITES (web + db)
+//
+if ($path === '/sites' && $method === 'POST') {
+  $token = api_require_auth($pdo, 'web');
+  $b = api_body_json();
+
+  $domain = trim((string)($b['domain'] ?? ''));
+  $root   = trim((string)($b['root_path'] ?? ''));
+  $force  = !empty($b['force_https']) ? 1 : 0;
+  $hsts   = !empty($b['hsts']) ? 1 : 0;
+  $disabled = !empty($b['disabled']) ? 1 : 0;
+
+  if (!domain_valid($domain)) api_json(400, ['ok'=>false,'error'=>'invalid_domain']);
+  if ($root === '') api_json(400, ['ok'=>false,'error'=>'missing_root_path']);
+
+  $userId = $token['user_id'] ? (int)$token['user_id'] : (int)($b['user_id'] ?? 0);
+  if ($userId <= 0) api_json(400, ['ok'=>false,'error'=>'missing_user_id']);
+
+  // idempotent: najdi existující site podle (user_id, domain)
+  $st = $pdo->prepare("SELECT * FROM sites WHERE user_id=? AND domain=? LIMIT 1");
+  $st->execute([$userId, $domain]);
+  $existing = $st->fetch();
+
+  if ($existing) {
+    $sid = (int)$existing['id'];
+    $status = $disabled ? 'disabled' : 'provisioning';
+
+    $pdo->prepare("UPDATE sites SET root_path=?, force_https=?, hsts=?, status=? WHERE id=?")
+        ->execute([$root, $force, $hsts, $status, $sid]);
+
+    $jid = $disabled
+      ? job_enqueue($pdo, 'deprovision_site', $sid, ['action'=>'disable'])
+      : job_enqueue($pdo, 'provision_site', $sid, ['action'=>'rebuild']);
+
+    api_json(200, ['ok'=>true,'id'=>$sid,'job_id'=>$jid,'mode'=>'updated']);
+  }
+
+  // create
+  $status = $disabled ? 'disabled' : 'provisioning';
+  $st = $pdo->prepare("INSERT INTO sites(user_id, domain, root_path, status, force_https, hsts) VALUES(?,?,?,?,?,?)");
+  $st->execute([$userId, $domain, $root, $status, $force, $hsts]);
+  $sid = (int)$pdo->lastInsertId();
+
+  $jid = $disabled
+    ? job_enqueue($pdo, 'deprovision_site', $sid, ['action'=>'disable'])
+    : job_enqueue($pdo, 'provision_site', $sid, ['action'=>'provision']);
+
+  api_json(201, ['ok'=>true,'id'=>$sid,'job_id'=>$jid,'mode'=>'created']);
+}
+
+if ($path === '/sites' && $method === 'GET') {
+  $token = api_require_auth($pdo, 'web');
+
+  $uid = !empty($token['user_id']) ? (int)$token['user_id'] : (int)($_GET['user_id'] ?? 0);
+  if ($uid <= 0) api_json(400, ['ok'=>false,'error'=>'missing_user_id']);
+
+  $st = $pdo->prepare("SELECT id,user_id,domain,root_path,status,force_https,hsts,created_at,last_error
+                       FROM sites WHERE user_id=? ORDER BY id DESC LIMIT 200");
+  $st->execute([$uid]);
+  api_json(200, ['ok'=>true,'items'=>$st->fetchAll()]);
+}
+
+if (preg_match('~^/sites/(\d+)$~', $path, $m)) {
+  $id = (int)$m[1];
+
+  if ($method === 'PATCH' || $method === 'PUT') {
+    $token = api_require_auth($pdo, 'web');
+    $b = api_body_json();
+
+    // načti
+    $st=$pdo->prepare("SELECT * FROM sites WHERE id=?");
+    $st->execute([$id]);
+    $site=$st->fetch();
+    if(!$site) api_json(404, ['ok'=>false,'error'=>'not_found']);
+
+    // pokud token nese user_id, hlídej vlastnictví
+    if (!empty($token['user_id']) && (int)$site['user_id'] !== (int)$token['user_id']) {
+      api_json(403, ['ok'=>false,'error'=>'forbidden']);
+    }
+
+    $fields = [];
+    $vals = [];
+
+    if (array_key_exists('root_path',$b)) { $fields[]="root_path=?"; $vals[]=trim((string)$b['root_path']); }
+    if (array_key_exists('force_https',$b)) { $fields[]="force_https=?"; $vals[]=!empty($b['force_https'])?1:0; }
+    if (array_key_exists('hsts',$b)) { $fields[]="hsts=?"; $vals[]=!empty($b['hsts'])?1:0; }
+
+    // enable/disable přes status (disabled/active)
+    if (array_key_exists('disabled',$b)) {
+      $disabled = !empty($b['disabled']);
+      $fields[] = "status=?";
+      $vals[] = $disabled ? 'disabled' : 'provisioning';
+    }
+
+    if ($fields) {
+      $vals[] = $id;
+      $pdo->prepare("UPDATE sites SET ".implode(',',$fields)." WHERE id=?")->execute($vals);
+    }
+
+    // pokud je disabled=true => deprovision vhost; pokud false => rebuild
+    if (array_key_exists('disabled',$b) && !empty($b['disabled'])) {
+      $jid = job_enqueue($pdo, 'deprovision_site', $id, ['action'=>'disable']);
+    } else {
+      $jid = job_enqueue($pdo, 'provision_site', $id, ['action'=>'rebuild']);
+    }
+
+    api_json(200, ['ok'=>true,'id'=>$id,'job_id'=>$jid]);
+  }
+
+  if ($method === 'DELETE') {
+    $token = api_require_auth($pdo, 'web');
+
+    $st=$pdo->prepare("SELECT * FROM sites WHERE id=?");
+    $st->execute([$id]);
+    $site=$st->fetch();
+    if(!$site) api_json(404, ['ok'=>false,'error'=>'not_found']);
+
+    if (!empty($token['user_id']) && (int)$site['user_id'] !== (int)$token['user_id']) {
+      api_json(403, ['ok'=>false,'error'=>'forbidden']);
+    }
+
+    $jid = job_enqueue($pdo, 'deprovision_site', $id, ['action'=>'delete']);
+    api_json(200, ['ok'=>true,'id'=>$id,'job_id'=>$jid]);
+  }
+}
+
+if (preg_match('~^/sites/(\d+)$~', $path, $m) && $method === 'GET') {
+  $token = api_require_auth($pdo, 'web');
+  $id = (int)$m[1];
+
+  $st=$pdo->prepare("SELECT * FROM sites WHERE id=?");
+  $st->execute([$id]);
+  $site=$st->fetch();
+  if(!$site) api_json(404, ['ok'=>false,'error'=>'not_found']);
+
+  if (!empty($token['user_id']) && (int)$site['user_id'] !== (int)$token['user_id']) {
+    api_json(403, ['ok'=>false,'error'=>'forbidden']);
+  }
+
+  api_json(200, ['ok'=>true,'item'=>$site]);
+}
+
+//
+// DB reset (site_reset_db_pass)
+//
+if (preg_match('~^/sites/(\d+)/db/reset-pass$~', $path, $m) && $method === 'POST') {
+  api_require_auth($pdo, 'db');
+  $sid = (int)$m[1];
+  $jid = job_enqueue($pdo, 'site_reset_db_pass', $sid, ['action'=>'reset_pass']);
+  api_json(200, ['ok'=>true,'site_id'=>$sid,'job_id'=>$jid]);
+}
+
+//
+// TUNNELS (proxy)
+//
+if ($path === '/tunnels' && $method === 'POST') {
+  $token = api_require_auth($pdo, 'proxy');
+  $b = api_body_json();
+
+  $sub = trim((string)($b['subdomain'] ?? ''));
+  $up  = trim((string)($b['upstream'] ?? ''));
+  $force  = !empty($b['force_https']) ? 1 : 0;
+  $hsts   = !empty($b['hsts']) ? 1 : 0;
+  $disabled = !empty($b['disabled']) ? 1 : 0;
+
+  if (!domain_valid($sub)) api_json(400, ['ok'=>false,'error'=>'invalid_subdomain']);
+  if ($up === '' || !preg_match('~^https?://~i', $up)) api_json(400, ['ok'=>false,'error'=>'invalid_upstream']);
+
+  $userId = $token['user_id'] ? (int)$token['user_id'] : (int)($b['user_id'] ?? 0);
+  if ($userId <= 0) api_json(400, ['ok'=>false,'error'=>'missing_user_id']);
+
+  $st = $pdo->prepare("SELECT * FROM tunnels WHERE user_id=? AND subdomain=? LIMIT 1");
+  $st->execute([$userId, $sub]);
+  $existing = $st->fetch();
+
+  $status = $disabled ? 'disabled' : 'provisioning';
+
+  if ($existing) {
+    $tid = (int)$existing['id'];
+
+    $pdo->prepare("UPDATE tunnels SET upstream=?, force_https=?, hsts=?, status=? WHERE id=?")
+        ->execute([$up, $force, $hsts, $status, $tid]);
+
+    $jid = $disabled
+      ? job_enqueue($pdo, 'deprovision_tunnel', $tid, ['action'=>'disable'])
+      : job_enqueue($pdo, 'provision_tunnel', $tid, ['action'=>'rebuild']);
+
+    api_json(200, ['ok'=>true,'id'=>$tid,'job_id'=>$jid,'mode'=>'updated']);
+  }
+
+  $pdo->prepare("INSERT INTO tunnels(user_id, subdomain, upstream, status, force_https, hsts) VALUES(?,?,?,?,?,?)")
+      ->execute([$userId, $sub, $up, $status, $force, $hsts]);
+  $tid = (int)$pdo->lastInsertId();
+
+  $jid = $disabled
+    ? job_enqueue($pdo, 'deprovision_tunnel', $tid, ['action'=>'disable'])
+    : job_enqueue($pdo, 'provision_tunnel', $tid, ['action'=>'provision']);
+
+  api_json(201, ['ok'=>true,'id'=>$tid,'job_id'=>$jid,'mode'=>'created']);
+}
+
+if ($path === '/tunnels' && $method === 'GET') {
+  $token = api_require_auth($pdo, 'proxy');
+
+  $uid = !empty($token['user_id']) ? (int)$token['user_id'] : (int)($_GET['user_id'] ?? 0);
+  if ($uid <= 0) api_json(400, ['ok'=>false,'error'=>'missing_user_id']);
+
+  $st = $pdo->prepare("SELECT id,user_id,subdomain,upstream,status,force_https,hsts,created_at,last_error
+                       FROM tunnels WHERE user_id=? ORDER BY id DESC LIMIT 200");
+  $st->execute([$uid]);
+  api_json(200, ['ok'=>true,'items'=>$st->fetchAll()]);
+}
+
+if (preg_match('~^/tunnels/(\d+)$~', $path, $m) && $method === 'GET') {
+  $token = api_require_auth($pdo, 'proxy');
+  $id = (int)$m[1];
+
+  $st=$pdo->prepare("SELECT * FROM tunnels WHERE id=?");
+  $st->execute([$id]);
+  $t=$st->fetch();
+  if(!$t) api_json(404, ['ok'=>false,'error'=>'not_found']);
+
+  if (!empty($token['user_id']) && (int)$t['user_id'] !== (int)$token['user_id']) {
+    api_json(403, ['ok'=>false,'error'=>'forbidden']);
+  }
+
+  api_json(200, ['ok'=>true,'item'=>$t]);
+}
+
+if (preg_match('~^/tunnels/(\d+)$~', $path, $m)) {
+  $id = (int)$m[1];
+
+  if ($method === 'PATCH' || $method === 'PUT') {
+    $token = api_require_auth($pdo, 'proxy');
+    $b = api_body_json();
+
+    $st=$pdo->prepare("SELECT * FROM tunnels WHERE id=?");
+    $st->execute([$id]);
+    $t=$st->fetch();
+    if(!$t) api_json(404, ['ok'=>false,'error'=>'not_found']);
+
+    if (!empty($token['user_id']) && (int)$t['user_id'] !== (int)$token['user_id']) {
+      api_json(403, ['ok'=>false,'error'=>'forbidden']);
+    }
+
+    $fields=[]; $vals=[];
+    if (array_key_exists('upstream',$b)) { $fields[]="upstream=?"; $vals[]=trim((string)$b['upstream']); }
+    if (array_key_exists('force_https',$b)) { $fields[]="force_https=?"; $vals[]=!empty($b['force_https'])?1:0; }
+    if (array_key_exists('hsts',$b)) { $fields[]="hsts=?"; $vals[]=!empty($b['hsts'])?1:0; }
+
+    if (array_key_exists('disabled',$b)) {
+      $disabled = !empty($b['disabled']);
+      $fields[]="status=?";
+      $vals[] = $disabled ? 'disabled' : 'provisioning';
+    }
+
+    if ($fields) {
+      $vals[]=$id;
+      $pdo->prepare("UPDATE tunnels SET ".implode(',',$fields)." WHERE id=?")->execute($vals);
+    }
+
+    if (array_key_exists('disabled',$b) && !empty($b['disabled'])) {
+      $jid = job_enqueue($pdo, 'deprovision_tunnel', $id, ['action'=>'disable']);
+    } else {
+      $jid = job_enqueue($pdo, 'provision_tunnel', $id, ['action'=>'rebuild']);
+    }
+
+    api_json(200, ['ok'=>true,'id'=>$id,'job_id'=>$jid]);
+  }
+
+  if ($method === 'DELETE') {
+    $token = api_require_auth($pdo, 'proxy');
+
+    $st=$pdo->prepare("SELECT * FROM tunnels WHERE id=?");
+    $st->execute([$id]);
+    $t=$st->fetch();
+    if(!$t) api_json(404, ['ok'=>false,'error'=>'not_found']);
+
+    if (!empty($token['user_id']) && (int)$t['user_id'] !== (int)$token['user_id']) {
+      api_json(403, ['ok'=>false,'error'=>'forbidden']);
+    }
+
+    $jid = job_enqueue($pdo, 'deprovision_tunnel', $id, ['action'=>'delete']);
+    api_json(200, ['ok'=>true,'id'=>$id,'job_id'=>$jid]);
+  }
+}
+
+//
+// FTP (ftp_accounts + jobs ftp_create/reset/delete)
+//
+if ($path === '/ftp' && $method === 'POST') {
+  $token = api_require_auth($pdo, 'ftp');
+  $b = api_body_json();
+
+  $siteId = (int)($b['site_id'] ?? 0);
+  if ($siteId <= 0) api_json(400, ['ok'=>false,'error'=>'missing_site_id']);
+
+  $st=$pdo->prepare("SELECT * FROM sites WHERE id=?");
+  $st->execute([$siteId]);
+  $site=$st->fetch();
+  if(!$site) api_json(404, ['ok'=>false,'error'=>'site_not_found']);
+
+  if (!empty($token['user_id']) && (int)$site['user_id'] !== (int)$token['user_id']) {
+    api_json(403, ['ok'=>false,'error'=>'forbidden']);
+  }
+
+  $username = 'ftp_'.$siteId.'_'.substr(bin2hex(random_bytes(6)),0,10);
+  $home = rtrim((string)$site['root_path'],'/');
+  $home = preg_replace('~/public$~', '', $home);
+
+  $pdo->prepare("INSERT INTO ftp_accounts(user_id, site_id, username, home_dir, status) VALUES(?,?,?,?, 'provisioning')")
+      ->execute([(int)$site['user_id'], $siteId, $username, $home]);
+  $id = (int)$pdo->lastInsertId();
+
+  $jid = job_enqueue($pdo, 'ftp_create', $id, ['action'=>'create']);
+  api_json(201, ['ok'=>true,'id'=>$id,'job_id'=>$jid,'username'=>$username]);
+}
+
+if ($path === '/ftp' && $method === 'GET') {
+  $token = api_require_auth($pdo, 'ftp');
+  $uid = !empty($token['user_id']) ? (int)$token['user_id'] : (int)($_GET['user_id'] ?? 0);
+  if ($uid <= 0) api_json(400, ['ok'=>false,'error'=>'missing_user_id']);
+
+  $st = $pdo->prepare("SELECT id,user_id,site_id,username,home_dir,status,created_at,last_error
+                       FROM ftp_accounts WHERE user_id=? ORDER BY id DESC LIMIT 200");
+  $st->execute([$uid]);
+  api_json(200, ['ok'=>true,'items'=>$st->fetchAll()]);
+}
+
+if (preg_match('~^/ftp/(\d+)/reset-pass$~', $path, $m) && $method === 'POST') {
+  api_require_auth($pdo, 'ftp');
+  $id = (int)$m[1];
+  $jid = job_enqueue($pdo, 'ftp_reset_pass', $id, ['action'=>'reset_pass']);
+  api_json(200, ['ok'=>true,'id'=>$id,'job_id'=>$jid]);
+}
+
+if (preg_match('~^/ftp/(\d+)$~', $path, $m) && $method === 'DELETE') {
+  api_require_auth($pdo, 'ftp');
+  $id = (int)$m[1];
+  $jid = job_enqueue($pdo, 'ftp_delete', $id, ['action'=>'delete']);
+  api_json(200, ['ok'=>true,'id'=>$id,'job_id'=>$jid]);
+}
+
+//
+// WireGuard (wg_peers + job wg_apply + client config return)
+//
+if ($path === '/wg/peers' && $method === 'POST') {
+  api_require_auth($pdo, 'wireguard');
+  $b = api_body_json();
+
+  $name = trim((string)($b['name'] ?? 'peer'));
+  $ip   = trim((string)($b['ip'] ?? ''));
+  $pub  = trim((string)($b['public_key'] ?? ''));
+  $psk  = trim((string)($b['preshared_key'] ?? ''));
+  $allowed = trim((string)($b['allowed_ips'] ?? ''));
+  $active  = array_key_exists('is_active',$b) ? (!empty($b['is_active']) ? 1 : 0) : 1;
+
+  $wantGen = !empty($b['generate']) || $pub === '';
+  $generated = null;
+
+  // když chce generovat, tak vygeneruj klientské klíče + PSK
+  if ($wantGen) {
+    $generated = wg_generate_keys();
+    $pub = $generated['public'];
+    if ($psk === '') $psk = $generated['preshared'];
+  }
+
+  if ($ip === '' || $pub === '') api_json(400, ['ok'=>false,'error'=>'missing_ip_or_public_key']);
+
+  // idempotent: prefer public_key, fallback ip
+  $ex = null;
+  $st = $pdo->prepare("SELECT * FROM wg_peers WHERE public_key=? LIMIT 1");
+  $st->execute([$pub]);
+  $ex = $st->fetch();
+
+  if (!$ex) {
+    $st = $pdo->prepare("SELECT * FROM wg_peers WHERE ip=? LIMIT 1");
+    $st->execute([$ip]);
+    $ex = $st->fetch();
+  }
+
+  if ($ex) {
+    $id = (int)$ex['id'];
+    $pdo->prepare("UPDATE wg_peers SET name=?, ip=?, public_key=?, preshared_key=?, allowed_ips=?, is_active=? WHERE id=?")
+        ->execute([$name, $ip, $pub, ($psk?:null), ($allowed?:null), $active, $id]);
+
+    $jid = job_enqueue($pdo, 'wg_apply', 0, ['reason'=>'update_peer','peer_id'=>$id]);
+
+    // vrať config jen když jsme generovali (private key neukládáme)
+    $resp = ['ok'=>true,'id'=>$id,'job_id'=>$jid,'mode'=>'updated'];
+    if ($generated) {
+      // načti row pro config (po update)
+      $st=$pdo->prepare("SELECT * FROM wg_peers WHERE id=?");
+      $st->execute([$id]);
+      $row=$st->fetch() ?: $ex;
+
+      $cfg = wg_build_client_config($pdo, $row, $generated['private'], $generated['public'], $psk);
+      $resp['generated'] = [
+        'private_key' => $generated['private'],
+        'public_key' => $generated['public'],
+        'preshared_key' => $psk,
+        'config' => $cfg,
+      ];
+    }
+
+    api_json(200, $resp);
+  }
+
+  // create
+  $pdo->prepare("INSERT INTO wg_peers(name, ip, public_key, preshared_key, allowed_ips, is_active)
+                 VALUES(?,?,?,?,?,?)")
+      ->execute([$name, $ip, $pub, ($psk?:null), ($allowed?:null), $active]);
+
+  $id = (int)$pdo->lastInsertId();
+  $jid = job_enqueue($pdo, 'wg_apply', 0, ['reason'=>'add_peer','peer_id'=>$id]);
+
+  $resp = ['ok'=>true,'id'=>$id,'job_id'=>$jid,'mode'=>'created'];
+
+  if ($generated) {
+    $st=$pdo->prepare("SELECT * FROM wg_peers WHERE id=?");
+    $st->execute([$id]);
+    $row=$st->fetch() ?: ['name'=>$name,'ip'=>$ip];
+
+    $cfg = wg_build_client_config($pdo, $row, $generated['private'], $generated['public'], $psk);
+    $resp['generated'] = [
+      'private_key' => $generated['private'],
+      'public_key' => $generated['public'],
+      'preshared_key' => $psk,
+      'config' => $cfg,
+    ];
+  }
+
+  api_json(201, $resp);
+}
+
+if ($path === '/wg/peers' && $method === 'GET') {
+  api_require_auth($pdo, 'wireguard');
+  $items = $pdo->query("SELECT id,name,ip,public_key,allowed_ips,is_active,created_at
+                        FROM wg_peers ORDER BY id DESC LIMIT 500")->fetchAll();
+  api_json(200, ['ok'=>true,'items'=>$items]);
+}
+
+if (preg_match('~^/wg/peers/(\d+)$~', $path, $m) && $method === 'GET') {
+  api_require_auth($pdo, 'wireguard');
+  $id = (int)$m[1];
+  $st=$pdo->prepare("SELECT * FROM wg_peers WHERE id=?");
+  $st->execute([$id]);
+  $p=$st->fetch();
+  if(!$p) api_json(404, ['ok'=>false,'error'=>'not_found']);
+  api_json(200, ['ok'=>true,'item'=>$p]);
+}
+
+if (preg_match('~^/wg/peers/(\d+)/toggle$~', $path, $m) && $method === 'POST') {
+  api_require_auth($pdo, 'wireguard');
+  $id = (int)$m[1];
+  $b = api_body_json();
+
+  $on = array_key_exists('is_active',$b) ? (!empty($b['is_active']) ? 1 : 0) : null;
+  if ($on === null) api_json(400, ['ok'=>false,'error'=>'missing_is_active']);
+
+  $pdo->prepare("UPDATE wg_peers SET is_active=? WHERE id=?")->execute([$on, $id]);
+  $jid = job_enqueue($pdo, 'wg_apply', 0, ['reason'=>'toggle_peer','peer_id'=>$id]);
+  api_json(200, ['ok'=>true,'id'=>$id,'job_id'=>$jid]);
+}
+
+if (preg_match('~^/wg/peers/(\d+)$~', $path, $m) && $method === 'DELETE') {
+  api_require_auth($pdo, 'wireguard');
+  $id = (int)$m[1];
+  $pdo->prepare("DELETE FROM wg_peers WHERE id=?")->execute([$id]);
+  $jid = job_enqueue($pdo, 'wg_apply', 0, ['reason'=>'delete_peer','peer_id'=>$id]);
+  api_json(200, ['ok'=>true,'id'=>$id,'job_id'=>$jid]);
+}
+
+// default
+api_json(404, ['ok'=>false,'error'=>'not_found','path'=>$path]);

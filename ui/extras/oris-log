@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+MODE="${1:-}"          # unit|file
+TARGET="${2:-}"        # unit name or file key
+LINES="${3:-200}"
+
+# sane defaults / limits
+if ! [[ "$LINES" =~ ^[0-9]+$ ]]; then LINES=200; fi
+if (( LINES < 20 )); then LINES=20; fi
+if (( LINES > 5000 )); then LINES=5000; fi
+
+# Whitelist systemd units
+ALLOWED_UNITS=(
+  nginx
+  php8.2-fpm
+  mariadb
+  postfix
+  dovecot
+  rspamd
+  fail2ban
+  redis-server
+  vsftpd
+  cron
+  wg-quick@wg0
+  oris-provisioner
+  oris-stats-worker
+)
+
+# Whitelist log files (keys -> paths)
+# Uprav si podle toho, co máš na systému.
+declare -A ALLOWED_FILES=(
+  [syslog]="/var/log/syslog"
+  [auth]="/var/log/auth.log"
+  [mail]="/var/log/mail.log"
+  [nginx_error]="/var/log/nginx/error.log"
+  [nginx_access]="/var/log/nginx/access.log"
+  [fail2ban]="/var/log/fail2ban.log"
+  [oris_provisioner]="/var/log/oris-core/provisioner-python.log"
+)
+
+is_allowed_unit() {
+  local u="$1"
+  for x in "${ALLOWED_UNITS[@]}"; do
+    [[ "$x" == "$u" ]] && return 0
+  done
+  return 1
+}
+
+usage() {
+  echo "Usage:"
+  echo "  oris-log unit <unit> [lines]"
+  echo "  oris-log file <key>  [lines]"
+  echo ""
+  echo "Allowed unit(s): ${ALLOWED_UNITS[*]}"
+  echo "Allowed file key(s): ${!ALLOWED_FILES[*]}"
+  exit 2
+}
+
+case "$MODE" in
+  unit)
+    is_allowed_unit "$TARGET" || { echo "Unit not allowed: $TARGET"; exit 1; }
+    exec /usr/bin/journalctl -u "$TARGET" -n "$LINES" --no-pager -o short-iso
+    ;;
+  file)
+    [[ -n "${ALLOWED_FILES[$TARGET]+x}" ]] || { echo "File key not allowed: $TARGET"; exit 1; }
+    f="${ALLOWED_FILES[$TARGET]}"
+    [[ -f "$f" ]] || { echo "Log file missing: $f"; exit 1; }
+    exec /usr/bin/tail -n "$LINES" "$f"
+    ;;
+  *)
+    usage
+    ;;
+esac
