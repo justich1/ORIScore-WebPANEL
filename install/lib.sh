@@ -259,7 +259,7 @@ write_python_config() {
   "python_bin": "$PROJECT_ROOT/.venv/bin/python",
   "paths": {
     "panel_root": "/var/www/oris-panel",
-    "sites_base_dir": "/var/lib/oris-core/sites",
+    "sites_base_dir": "/var/www/sites",
     "acme_webroot": "/var/www/letsencrypt"
   }
 }
@@ -302,15 +302,6 @@ Defaults:www-data !requiretty
 # Bezpečné čtení logů: PHP smí volat jen whitelist wrapper, ne libovolný journalctl/tail.
 www-data ALL=(root) NOPASSWD: /var/www/oris-panel/extras/oris-log *
 
-# Legacy status helpers v některých starších stránkách panelu.
-www-data ALL=(root) NOPASSWD: /usr/bin/systemctl, /bin/systemctl, /usr/sbin/service
-www-data ALL=(root) NOPASSWD: /usr/sbin/nginx, /usr/bin/certbot
-www-data ALL=(root) NOPASSWD: /usr/sbin/ufw, /usr/bin/fail2ban-client
-www-data ALL=(root) NOPASSWD: /usr/sbin/iptables, /sbin/iptables, /usr/sbin/ip6tables, /sbin/ip6tables
-www-data ALL=(root) NOPASSWD: /usr/sbin/iptables-save, /sbin/iptables-save, /usr/sbin/iptables-restore, /sbin/iptables-restore
-www-data ALL=(root) NOPASSWD: /usr/bin/ss, /bin/ss
-www-data ALL=(root) NOPASSWD: /usr/bin/tail, /usr/bin/cat, /bin/cat, /usr/bin/tee, /usr/bin/sed, /usr/bin/grep, /usr/bin/awk
-www-data ALL=(root) NOPASSWD: /usr/sbin/vsftpd, /usr/sbin/useradd, /usr/sbin/usermod, /usr/sbin/userdel, /usr/sbin/chpasswd, /bin/chown, /bin/chmod, /bin/mkdir, /bin/rm, /bin/cp, /bin/mv
 SUD
   chmod 0440 /etc/sudoers.d/oris-panel
   visudo -cf /etc/sudoers.d/oris-panel
