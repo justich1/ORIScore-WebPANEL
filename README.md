@@ -204,6 +204,40 @@ oris_webserver/
     └── language/
 ```
 
+## Instalace z Git repozitáře
+
+ORIS Hosting Webserver Core lze nainstalovat přímo z Git repozitáře. Tento postup je vhodný pro čistý server, testovací instalaci i budoucí aktualizace přes `git pull`.
+
+### 1. Příprava systému
+
+Na čistém Debian/Ubuntu serveru nejdříve aktualizujte systém a nainstalujte základní nástroje:
+
+```bash
+apt update
+apt upgrade -y
+apt install -y git curl ca-certificates sudo
+```
+
+### 2. Stažení repozitáře
+
+Projekt se standardně instaluje do adresáře `/opt/oris_webserver`:
+
+```bash
+cd /opt
+git clone https://github.com/justich1/ORIScore-WebPANEL.git oris_webserver
+cd /opt/oris_webserver
+```
+
+### 3. Spuštění instalátoru
+
+Instalace se spouští z adresáře projektu:
+
+```bash
+chmod +x install/install.sh
+./install/install.sh
+```
+
+
 ## Instalace
 
 Instalace je připravená pro Debian/Ubuntu-like server s `apt`, systemd a root přístupem.
