@@ -134,7 +134,6 @@ Aktuálně jsou připravené jazyky:
 cs.php  - čeština
 en.php  - angličtina
 de.php  - němčina
-sk.php  - slovenština
 ```
 
 Jazyky se načítají podle obsahu v `language/`:
