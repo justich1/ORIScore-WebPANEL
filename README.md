@@ -1,6 +1,6 @@
-# ORIScore Hosting PANEL
+# ORIScore WebPANEL
 
-ORIScore Hosting PANEL je administrační webový panel pro správu vlastního Linux webserveru. Projekt kombinuje lehké PHP rozhraní s Python provisionerem, který přes frontu úloh provádí systémové změny bezpečněji mimo samotný webový proces.
+ORIScore WebPANEL je administrační webový panel pro správu vlastního Linux webserveru. Projekt kombinuje lehké PHP rozhraní s Python provisionerem, který přes frontu úloh provádí systémové změny bezpečněji mimo samotný webový proces.
 
 Panel je určený pro správu webů, reverzních proxy, databází, FTP účtů, HTTPS certifikátů, e-mailového serveru, firewallu, WireGuardu, systémových služeb, logů, záloh a základního monitoringu serveru.
 
@@ -206,7 +206,7 @@ oris_webserver/
 
 ## Instalace z Git repozitáře
 
-ORIS Hosting Webserver Core lze nainstalovat přímo z Git repozitáře. Tento postup je vhodný pro čistý server, testovací instalaci i budoucí aktualizace přes `git pull`.
+ORIScore WebPANEL lze nainstalovat přímo z Git repozitáře. Tento postup je vhodný pro čistý server, testovací instalaci i budoucí aktualizace přes `git pull`.
 
 ### 1. Příprava systému
 
@@ -235,18 +235,6 @@ Instalace se spouští z adresáře projektu:
 ```bash
 chmod +x install/install.sh
 ./install/install.sh
-```
-
-
-## Instalace
-
-Instalace je připravená pro Debian/Ubuntu-like server s `apt`, systemd a root přístupem.
-
-Spuštění instalace:
-
-```bash
-cd /opt/oris_webserver
-sudo bash install/install.sh
 ```
 
 Instalátor provede zejména:
