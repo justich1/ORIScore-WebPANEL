@@ -234,6 +234,9 @@ Instalace se spouští z adresáře projektu:
 
 ```bash
 chmod +x install/install.sh
+chmod +x install/repair.sh
+chmod +x install/upgrade.sh
+chmod +x install/lib.sh
 ./install/install.sh
 ```
 
