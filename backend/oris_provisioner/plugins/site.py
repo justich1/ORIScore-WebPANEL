@@ -65,6 +65,58 @@ def _reload_fpm(unit: str) -> None:
         run(["systemctl", "restart", unit], check=False)
 
 
+PANEL_PHP_SOCKET = "/run/php/oris-panel.sock"
+
+
+def ensure_panel_php_pool() -> str:
+    """Zajistí stabilní PHP-FPM pool/socket pro administraci ORISu.
+
+    Běžné weby používají vlastní oris-site-X.sock. Panel a phpMyAdmin nesmí
+    záviset na aliasu /run/php/php-fpm.sock, protože ten na Debianu často
+    neexistuje nebo je jen rozbitý alternatives symlink.
+    """
+    version, pool_dir, unit = _fpm_info()
+    if not version:
+        raise RuntimeError("PHP-FPM pool.d adresář nebyl nalezen v /etc/php/*/fpm/pool.d")
+
+    pool_dir.mkdir(parents=True, exist_ok=True)
+    conf = f"""[oris_panel]
+user = www-data
+group = www-data
+
+listen = {PANEL_PHP_SOCKET}
+listen.owner = www-data
+listen.group = www-data
+listen.mode = 0660
+
+pm = ondemand
+pm.max_children = 5
+pm.process_idle_timeout = 10s
+pm.max_requests = 300
+
+request_terminate_timeout = 300s
+
+php_admin_value[memory_limit] = 1024M
+php_admin_value[upload_max_filesize] = 1024M
+php_admin_value[post_max_size] = 1024M
+php_admin_value[max_execution_time] = 300
+php_admin_value[max_input_time] = 300
+php_admin_value[date.timezone] = Europe/Prague
+"""
+
+    pool_file = pool_dir / "oris_panel.conf"
+    old = pool_file.read_text(encoding="utf-8", errors="ignore") if pool_file.exists() else ""
+    if old != conf:
+        atomic_write(pool_file, conf)
+
+    rc, out = run([f"php-fpm{version}", "-t"], check=False)
+    if rc != 0:
+        raise RuntimeError(f"PHP-FPM konfigurace je chybná:\n{out}")
+
+    _reload_fpm(unit)
+    return PANEL_PHP_SOCKET
+
+
 def _size(v: Any, default: str) -> str:
     s = str(v or default).strip()
     return s if re.match(r"^\d+[KMG]?$", s, re.I) else default
@@ -200,8 +252,17 @@ php_admin_value[opcache.enable] = {opcache}
 
 
 def panel_vhost(ctx: Ctx) -> None:
-    # Panelový vhost je samostatný modul, aby šel nastavovat režim přístupu
-    # IP / IP+doména / jen doména a certifikát pro admin doménu.
+    # Panelový vhost musí vždy používat vlastní stabilní socket.
+    sock = ensure_panel_php_pool()
+    try:
+        ctx.exec(
+            "INSERT INTO settings(k,v) VALUES('php_fpm_socket', %s) "
+            "ON DUPLICATE KEY UPDATE v=VALUES(v)",
+            (sock,),
+        )
+    except Exception:
+        pass
+
     from .panel import write_panel_vhost
     write_panel_vhost(ctx)
 

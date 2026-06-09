@@ -176,7 +176,17 @@ def _https_server(ctx: Ctx, domain: str, sock: str, acme: str, cert: Path, key: 
 
 
 def write_panel_vhost(ctx: Ctx, *, force_plain_http: bool = False) -> None:
-    from .site import ensure_phpmyadmin_snippet
+    from .site import ensure_panel_php_pool, ensure_phpmyadmin_snippet
+
+    sock = ensure_panel_php_pool()
+    try:
+        ctx.exec(
+            "INSERT INTO settings(k,v) VALUES('php_fpm_socket', %s) "
+            "ON DUPLICATE KEY UPDATE v=VALUES(v)",
+            (sock,),
+        )
+    except Exception:
+        pass
 
     ensure_phpmyadmin_snippet()
     try:
@@ -184,7 +194,6 @@ def write_panel_vhost(ctx: Ctx, *, force_plain_http: bool = False) -> None:
         ensure_security_files(ctx)
     except Exception:
         pass
-    sock = ctx.php_socket()
     acme = ctx.ensure_acme_webroot()
 
     mode = ctx.setting("panel_access_mode", "ip").strip().lower()

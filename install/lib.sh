@@ -22,11 +22,70 @@ PY
 
 mysql_root() { mysql --protocol=socket -u root "$@"; }
 
+PANEL_PHP_SOCKET="/run/php/oris-panel.sock"
+
 php_socket() {
+  # Vrací skutečný systémový PHP-FPM socket, pokud existuje.
+  # Nepoužívat pro ORIS panel: panel má vlastní stabilní socket /run/php/oris-panel.sock.
   if [[ -S /run/php/php-fpm.sock ]]; then echo /run/php/php-fpm.sock; return; fi
   local s
   s="$(ls /run/php/php*-fpm.sock 2>/dev/null | sort -V | tail -n1 || true)"
   [[ -n "$s" ]] && echo "$s" || echo /run/php/php-fpm.sock
+}
+
+php_fpm_version() {
+  local d v
+  d="$(find /etc/php -maxdepth 3 -type d -path '/etc/php/*/fpm/pool.d' 2>/dev/null | sort -V | tail -n1 || true)"
+  if [[ -n "$d" ]]; then
+    v="${d#/etc/php/}"
+    v="${v%%/*}"
+    echo "$v"
+    return 0
+  fi
+  php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;' 2>/dev/null || true
+}
+
+ensure_panel_php_pool() {
+  echo "==> Kontroluji PHP-FPM pool pro ORIS panel"
+
+  local version pool_dir unit
+  version="$(php_fpm_version)"
+  if [[ -z "$version" ]]; then
+    echo "ERROR: Nenalezena PHP-FPM verze v /etc/php/*/fpm/pool.d" >&2
+    return 1
+  fi
+
+  pool_dir="/etc/php/${version}/fpm/pool.d"
+  unit="php${version}-fpm"
+  mkdir -p "$pool_dir"
+
+  cat > "$pool_dir/oris_panel.conf" <<EOF
+[oris_panel]
+user = www-data
+group = www-data
+
+listen = ${PANEL_PHP_SOCKET}
+listen.owner = www-data
+listen.group = www-data
+listen.mode = 0660
+
+pm = ondemand
+pm.max_children = 5
+pm.process_idle_timeout = 10s
+pm.max_requests = 300
+
+request_terminate_timeout = 300s
+
+php_admin_value[memory_limit] = 1024M
+php_admin_value[upload_max_filesize] = 1024M
+php_admin_value[post_max_size] = 1024M
+php_admin_value[max_execution_time] = 300
+php_admin_value[max_input_time] = 300
+php_admin_value[date.timezone] = Europe/Prague
+EOF
+
+  "php-fpm${version}" -t
+  systemctl restart "$unit" || systemctl reload "$unit" || true
 }
 
 install_packages() {
@@ -131,7 +190,6 @@ return [
   'mail_db' => ['host'=>'127.0.0.1','port'=>3306,'name'=>'oris_mail','user'=>'oris_mail','pass'=>'$panel_pass'],
   'db_admin' => ['user'=>'oris_admin','pass'=>'$panel_pass'],
   'session_name' => 'oris_panel',
-  'langs' => ['cs','en','de','sk'],
   'default_lang' => 'cs',
 ];
 PHP
@@ -144,11 +202,9 @@ PHP
 }
 
 configure_php_alias_socket() {
-  echo "==> Ověřuji PHP-FPM socket"
-  local sock; sock="$(php_socket)"
-  if [[ "$sock" != "/run/php/php-fpm.sock" && -S "$sock" ]]; then
-    ln -sfn "$sock" /run/php/php-fpm.sock || true
-  fi
+  # Starý alias /run/php/php-fpm.sock se už pro panel nepoužívá.
+  # Panel má vlastní stabilní pool/socket, aby ho změny site poolů nerozbily.
+  ensure_panel_php_pool
 }
 
 ensure_config_php_mail_db() {
@@ -268,7 +324,7 @@ JSON
   chmod 0600 /etc/oris-panel/provisioner.json
   local certbot_email_sql
   certbot_email_sql=$(printf '%s' "$certbot_email" | sed "s/'/''/g")
-  mysql_root oris_panel -e "INSERT INTO settings(k,v) VALUES('certbot_email','${certbot_email_sql}'),('acme_webroot','/var/www/letsencrypt'),('php_fpm_socket','/run/php/php-fpm.sock'),('web_root_bases','/var/lib/oris-core/sites\n/var/www/html\n/data/www'),('upload_staging_dir','/var/lib/oris-core/uploads') ON DUPLICATE KEY UPDATE v=VALUES(v); INSERT IGNORE INTO settings(k,v) VALUES('panel_access_mode','ip'),('panel_domain',''),('panel_force_https','0'),('panel_ssl_status','none'),('panel_ssl_last_error','');"
+  mysql_root oris_panel -e "INSERT INTO settings(k,v) VALUES('certbot_email','${certbot_email_sql}'),('acme_webroot','/var/www/letsencrypt'),('php_fpm_socket','/run/php/oris-panel.sock'),('web_root_bases','/var/www/sites\n/var/www/html\n/data/www'),('upload_staging_dir','/var/lib/oris-core/uploads') ON DUPLICATE KEY UPDATE v=VALUES(v); INSERT IGNORE INTO settings(k,v) VALUES('panel_access_mode','ip'),('panel_domain',''),('panel_force_https','0'),('panel_ssl_status','none'),('panel_ssl_last_error','');"
 }
 
 configure_vsftpd() {
@@ -329,7 +385,7 @@ location ~ ^/phpmyadmin/(.+\.php)$ {
     fastcgi_param SCRIPT_FILENAME /usr/share/phpmyadmin/$1;
     fastcgi_param SCRIPT_NAME /phpmyadmin/$1;
     fastcgi_param DOCUMENT_ROOT /usr/share/phpmyadmin;
-    fastcgi_pass unix:/run/php/php-fpm.sock;
+    fastcgi_pass unix:/run/php/oris-panel.sock;
 }
 
 location ~* ^/phpmyadmin/(.+\.(jpg|jpeg|gif|css|png|js|ico|html|xml|txt|svg|woff|woff2|ttf|map))$ {
@@ -552,6 +608,7 @@ write_panel_nginx() {
   echo "==> Nastavuji Nginx vhost panelu"
   mkdir -p /var/www/letsencrypt/.well-known/acme-challenge
   chown -R www-data:www-data /var/www/letsencrypt
+  ensure_panel_php_pool
 
   # Preferuj Python generátor panelového vhostu, protože umí režim:
   # - jen IP
@@ -601,7 +658,7 @@ server {
 
     location ~ \.php$ {
         include snippets/fastcgi-php.conf;
-        fastcgi_pass unix:/run/php/php-fpm.sock;
+        fastcgi_pass unix:/run/php/oris-panel.sock;
     }
 
     location ~ /\.(?!well-known) {
@@ -664,10 +721,14 @@ start_services() {
 }
 
 repair_nginx_php_socket() {
-  local sock; sock="$(php_socket)"
-  if [[ -S "$sock" ]]; then
-    find /etc/nginx/sites-available /etc/nginx/sites-enabled -type f -name '*.conf' -print0 2>/dev/null | xargs -0 -r sed -i -E "s#unix:/run/php/php[0-9.]+-fpm.sock#unix:${sock}#g; s#unix:/run/php/php-fpm.sock#unix:${sock}#g"
-  fi
+  # Opravuje jen panel a phpMyAdmin snippet. Běžné weby mají vlastní oris-site-X.sock.
+  ensure_panel_php_pool
+  local sock="$PANEL_PHP_SOCKET"
+  for f in     /etc/nginx/sites-available/oris-panel.conf     /etc/nginx/sites-enabled/oris-panel.conf     /etc/nginx/snippets/phpmyadmin.conf
+  do
+    [[ -e "$f" ]] || continue
+    sed -i -E "s#unix:/run/php/php[0-9.]+-fpm.sock#unix:${sock}#g; s#unix:/run/php/php-fpm.sock#unix:${sock}#g" "$f"
+  done
 }
 
 configure_python_work_dirs() {
