@@ -38,6 +38,33 @@ function valid_port(string $v): bool {
   return $p >= 1 && $p <= 65535;
 }
 
+function valid_port_or_range(string $v): bool {
+  $v = trim($v);
+  if ($v === '') return false;
+
+  if (valid_port($v)) return true;
+
+  // UFW používá rozsah ve tvaru 40000:40100,
+  // do UI tokenu ale někdy pošleme 40000-40100 kvůli oddělovači dvojtečkou.
+  $v = str_replace('-', ':', $v);
+
+  if (!preg_match('~^(\d{1,5}):(\d{1,5})$~', $v, $m)) return false;
+
+  $a = (int)$m[1];
+  $b = (int)$m[2];
+
+  return $a >= 1 && $a <= 65535 && $b >= 1 && $b <= 65535 && $a <= $b;
+}
+
+function normalize_ufw_port(string $v): string {
+  return str_replace('-', ':', trim($v));
+}
+
+function token_port(string $v): string {
+  // token má tvar proto:port:scope, takže port nesmí obsahovat dvojtečku
+  return str_replace(':', '-', trim($v));
+}
+
 function parse_ufw_numbered(array $lines): array {
   $rules = [];
   foreach ($lines as $line) {
@@ -152,13 +179,13 @@ function parse_ss_listeners(array $lines): array {
       continue;
     }
 
-    if (!ctype_digit($port)) continue;
+    if (!valid_port_or_range($port)) continue;
 
     $items[] = [
       'proto' => $proto,
       'state' => $state,
       'addr'  => $addr,
-      'port'  => (int)$port,
+      'port'  => normalize_ufw_port($port),
       'proc'  => $proc,
       'raw'   => $line,
     ];
@@ -194,15 +221,64 @@ function classify_listener(array $it): string {
   return 'public';
 }
 
-function risk_tag(int $port, string $proto): ?string {
-  // jen “warning štítky” do UI
-  $p = $port;
+function risk_tag(int|string $port, string $proto): ?string {
+  $ps = (string)$port;
+
+  if ($proto === 'tcp' && (str_contains($ps, ':') || str_contains($ps, '-'))) {
+    return t('ufw.risk.ftp_pasv', [], 'FTP passive range');
+  }
+
+  $p = (int)$ps;
   if ($proto==='tcp' && in_array($p, [139,445], true)) return t('ufw.risk.smb', [], 'SMB (nedávat na internet)');
   if ($proto==='udp' && in_array($p, [137,138], true)) return t('ufw.risk.netbios', [], 'NetBIOS (jen LAN)');
   if ($proto==='udp' && $p===5353) return t('ufw.risk.mdns', [], 'mDNS/Avahi (jen LAN)');
   if ($proto==='tcp' && $p===21) return t('ufw.risk.ftp', [], 'FTP (radši SFTP)');
   if ($proto==='tcp' && in_array($p, [25,587,143,993,4190], true)) return t('ufw.risk.mail', [], 'MAIL (jen pokud používáš)');
   return null;
+}
+
+function read_simple_key_value_conf(string $path): array {
+  if (!is_readable($path)) return [];
+
+  $cfg = [];
+  foreach (file($path, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) ?: [] as $line) {
+    $line = trim($line);
+    if ($line === '' || str_starts_with($line, '#')) continue;
+    if (!str_contains($line, '=')) continue;
+
+    [$k, $v] = explode('=', $line, 2);
+    $cfg[strtolower(trim($k))] = trim($v);
+  }
+
+  return $cfg;
+}
+
+function detect_vsftpd_passive_ports(): array {
+  $cfg = read_simple_key_value_conf('/etc/vsftpd.conf');
+
+  if (!$cfg) return [];
+
+  $pasv = strtolower($cfg['pasv_enable'] ?? 'no');
+  if (!in_array($pasv, ['yes', 'true', '1'], true)) return [];
+
+  $min = trim((string)($cfg['pasv_min_port'] ?? ''));
+  $max = trim((string)($cfg['pasv_max_port'] ?? ''));
+
+  if (!valid_port($min) || !valid_port($max)) return [];
+
+  $a = (int)$min;
+  $b = (int)$max;
+
+  if ($a > $b) return [];
+
+  return [[
+    'proto' => 'tcp',
+    'state' => 'CONFIG',
+    'addr'  => '0.0.0.0',
+    'port'  => $a . ':' . $b,
+    'proc'  => 'vsftpd passive range',
+    'raw'   => 'vsftpd pasv_min_port=' . $a . ' pasv_max_port=' . $b,
+  ]];
 }
 
 /* ---------- ACTIONS ---------- */
@@ -252,7 +328,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['ufw_add'])) {
     'toip'=>trim((string)($_POST['toip'] ?? '')),
     'comment'=>trim((string)($_POST['comment'] ?? '')),
   ];
-  if (!valid_port($payload['port'])) { flash_set('err', t('ufw.flash.invalid_port', [], 'Neplatný port (1–65535)')); header('Location: /ufw.php'); exit; }
+  if (!valid_port_or_range($payload['port'])) {
+    flash_set('err', t('ufw.flash.invalid_port', [], 'Neplatný port nebo rozsah portů, např. 21 nebo 40000:40100'));
+    header('Location: /ufw.php'); exit;
+  }
+
+  $payload['port'] = normalize_ufw_port($payload['port']);
+
   if ($payload['from']!=='' && !valid_ip_or_cidr($payload['from'])) { flash_set('err', t('ufw.flash.invalid_from', [], 'Neplatné FROM (IP/CIDR)')); header('Location: /ufw.php'); exit; }
   if ($payload['toip']!=='' && !valid_ip_or_cidr($payload['toip'])) { flash_set('err', t('ufw.flash.invalid_to', [], 'Neplatné TO IP/CIDR')); header('Location: /ufw.php'); exit; }
   enqueue_job($pdo, 'ufw_rule', 0, $payload);
@@ -311,9 +393,21 @@ $lanNet   = cidr_to_network($lanCidrs[0] ?? '192.168.0.0/16') ?? '192.168.0.0/16
 
 $scanRaw = $_SESSION['ufw_scan'] ?? null;
 $scanItems = [];
+
 if (is_array($scanRaw)) {
   $scanItems = parse_ss_listeners($scanRaw);
 }
+
+// Přidat konfigurované porty, které se přes ss běžně neukážou.
+$scanItems = array_merge($scanItems, detect_vsftpd_passive_ports());
+
+// Dedupe podle proto + port + bind.
+$dedupe = [];
+foreach ($scanItems as $it) {
+  $k = $it['proto'] . '|' . $it['addr'] . '|' . $it['port'];
+  $dedupe[$k] = $it;
+}
+$scanItems = array_values($dedupe);
 
 render($pdo, t('page.ufw.title', [], 'UFW'), function() use ($isActive, $verboseOut, $rules, $numberedOut, $scanItems, $lanNet, $lanCidrs) { ?>
   <div class="card">
@@ -440,7 +534,7 @@ render($pdo, t('page.ufw.title', [], 'UFW'), function() use ($isActive, $verbose
                   <?php foreach ($groups[$g] as $it): ?>
                     <?php
                       $tag = risk_tag((int)$it['port'], (string)$it['proto']);
-                      $token = $it['proto'].':'.$it['port'].':'.$g;
+                      $token = $it['proto'].':'.token_port((string)$it['port']).':'.$g;
                     ?>
                     <tr>
                       <td>
@@ -451,7 +545,7 @@ render($pdo, t('page.ufw.title', [], 'UFW'), function() use ($isActive, $verbose
                         <?php endif; ?>
                       </td>
                       <td><code><?=h($it['proto'])?></code></td>
-                      <td><code><?= (int)$it['port'] ?></code></td>
+                      <td><code><?= h((string)$it['port']) ?></code></td>
                       <td><?=h($it['addr'])?></td>
                       <td><small><?=h($it['proc'])?></small></td>
                       <td>
