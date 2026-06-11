@@ -271,10 +271,83 @@ authenticated_headers = ["authentication-results"];
 def _postconf(key: str, value: str) -> None:
     run(["postconf", "-e", f"{key}={value}"], check=False)
 
+def _safe_mail_hostname(value: str) -> str:
+    host = str(value or "").strip().lower().rstrip(".")
+
+    if not host or "." not in host:
+        raise RuntimeError(f"Neplatný mail hostname: {value}")
+
+    if len(host) > 253:
+        raise RuntimeError(f"Mail hostname je moc dlouhý: {host}")
+
+    label = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+    if not re.fullmatch(rf"{label}(?:\.{label})+", host):
+        raise RuntimeError(f"Neplatný mail hostname: {host}")
+
+    return host
+
+
+def _fix_etc_hosts_hostname(hostname: str) -> None:
+    hosts = Path("/etc/hosts")
+    short = hostname.split(".", 1)[0]
+
+    try:
+        content = hosts.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        content = "127.0.0.1 localhost\n"
+
+    # Smažeme jen náš ORIS blok, zbytek /etc/hosts necháme být.
+    content = re.sub(
+        r"(?ms)\n?# ORIS mail hostname BEGIN\n.*?\n# ORIS mail hostname END\n?",
+        "\n",
+        content,
+    ).rstrip() + "\n"
+
+    block = f"""
+# ORIS mail hostname BEGIN
+127.0.1.1 {hostname} {short}
+# ORIS mail hostname END
+"""
+
+    atomic_write("/etc/hosts", content + block, 0o644)
+
+
+def _apply_system_mail_hostname(hostname: str) -> None:
+    hostname = _safe_mail_hostname(hostname)
+
+    run(["hostnamectl", "set-hostname", hostname], check=False)
+    atomic_write("/etc/mailname", hostname + "\n", 0o644)
+    _fix_etc_hosts_hostname(hostname)
+
+
+def _fix_postfix_chroot_resolv() -> None:
+    dst = Path("/var/spool/postfix/etc/resolv.conf")
+    dst.parent.mkdir(parents=True, exist_ok=True)
+
+    src = Path("/etc/resolv.conf")
+    if src.exists():
+        try:
+            shutil.copyfile(src.resolve() if src.is_symlink() else src, dst)
+        except Exception:
+            pass
+
+    if dst.exists():
+        run(["chown", "root:root", str(dst)], check=False)
+        run(["chmod", "644", str(dst)], check=False)
 
 def _write_postfix(ctx: Ctx) -> None:
     uid, gid = _vmail_ids()
-    hostname = ctx.setting("mail.postfix.myhostname", "") or socket.getfqdn()
+
+    configured_hostname = str(ctx.setting("mail.postfix.myhostname", "") or "").strip()
+    if configured_hostname:
+        hostname = _safe_mail_hostname(configured_hostname)
+        _apply_system_mail_hostname(hostname)
+    else:
+        hostname = str(socket.getfqdn() or "").strip().lower().rstrip(".")
+        if not hostname:
+            hostname = "localhost.localdomain"
+
+    _fix_postfix_chroot_resolv()
     milter = ctx.setting("mail.rspamd.milter", "127.0.0.1:11332")
     aliases_on = _setting_bool(ctx, "mail.postfix.aliases.enabled", True)
     tls_cert = ctx.setting("mail.postfix.tls_cert", "/etc/ssl/certs/ssl-cert-snakeoil.pem")
