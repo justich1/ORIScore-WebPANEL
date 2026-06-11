@@ -458,6 +458,9 @@ www-data ALL=(root) NOPASSWD: /usr/bin/fail2ban-client status
 www-data ALL=(root) NOPASSWD: /usr/bin/fail2ban-client status *
 www-data ALL=(root) NOPASSWD: /usr/bin/journalctl -u ssh -u fail2ban -n 40 --no-pager
 www-data ALL=(root) NOPASSWD: /usr/bin/tail -n 40 /var/log/nginx/error.log
+www-data ALL=(root) NOPASSWD: /usr/bin/ss -H -tulpen
+www-data ALL=(root) NOPASSWD: /usr/sbin/ufw status
+www-data ALL=(root) NOPASSWD: /usr/sbin/ufw status verbose
 SUD
 
   chmod 0440 /etc/sudoers.d/oris-panel
