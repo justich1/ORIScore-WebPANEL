@@ -78,16 +78,31 @@ function is_private_ipv4(string $ip): bool {
 }
 
 function detect_lan_cidrs_v4(): array {
-  // vrátí CIDR adresy lokálních interfaců, typicky "192.168.10.0/24" apod.
-  $out=[]; run("ip -o -4 addr show scope global | awk '{print \$4}'", $out);
+  $out = [];
+  run("ip -o -4 addr show scope global | awk '{print \$4}'", $out);
+
   $cidrs = [];
+
   foreach ($out as $c) {
     $c = trim($c);
     if ($c === '' || !str_contains($c, '/')) continue;
-    $cidrs[] = $c;
+
+    [$ip, $mask] = explode('/', $c, 2);
+
+    if (!filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) continue;
+
+    // Bereme jen privátní rozsahy / VPN, ne veřejnou VPS IP.
+    if (!is_private_ipv4($ip)) continue;
+
+    $net = cidr_to_network($c);
+    if ($net) $cidrs[] = $net;
   }
-  // fallback (když by ip nic nevrátil)
-  if (!$cidrs) $cidrs[] = '192.168.0.0/16';
+
+  if (!$cidrs) {
+    // Bezpečný fallback pro tvoji WireGuard síť.
+    $cidrs[] = '10.42.0.0/24';
+  }
+
   return array_values(array_unique($cidrs));
 }
 
@@ -255,9 +270,16 @@ if (isset($_GET['del']) && $_GET['del'] !== '') {
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['ufw_scan_ports'])) {
   csrf_check();
-  $ss=[];
-  run('sudo /usr/bin/ss -H -tulpen', $ss);
-  if (!$ss) run('sudo ss -H -tulpen', $ss);
+
+  $ss = [];
+  $rc = run('sudo -n /usr/bin/ss -H -tulpen', $ss);
+
+  if ($rc !== 0) {
+    unset($_SESSION['ufw_scan']);
+    flash_set('err', 'Sken portů selhal: ' . trim(implode("\n", $ss)));
+    header('Location: /ufw.php'); exit;
+  }
+
   $_SESSION['ufw_scan'] = $ss;
   flash_set('ok', t('ufw.flash.scan_done', [], 'Sken portů hotový'));
   header('Location: /ufw.php'); exit;
