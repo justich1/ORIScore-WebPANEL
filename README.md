@@ -6,6 +6,10 @@ Panel je určený pro správu webů, reverzních proxy, databází, FTP účtů,
 
 > **Stav projektu:** vývojová/beta verze.
 
+## Changelog
+
+Poslední změny jsou v souboru [CHANGELOG.md](CHANGELOG.md).
+
 ## Hlavní funkce
 
 ### Webhosting
