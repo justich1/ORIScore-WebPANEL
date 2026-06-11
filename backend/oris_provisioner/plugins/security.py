@@ -229,6 +229,44 @@ def valid_port(p: str) -> bool:
         return a.isdigit() and b.isdigit() and 1 <= int(a) <= int(b) <= 65535
     return p.isdigit() and 1 <= int(p) <= 65535
 
+def normalize_port(p: str) -> str:
+    return str(p or "").strip().replace("-", ":")
+
+
+def parse_port_token(token: str) -> tuple[str, str, str] | None:
+    """
+    Podporuje:
+      tcp:21:public
+      tcp:40000-40100:public
+      tcp:40000:40100:public
+    Vrací: proto, port_pro_ufw, scope
+    """
+    raw = str(token or "").strip()
+    parts = raw.split(":")
+
+    if len(parts) == 3:
+        proto, port, scope = parts
+    elif len(parts) == 4:
+        proto = parts[0]
+        port = parts[1] + ":" + parts[2]
+        scope = parts[3]
+    else:
+        return None
+
+    proto = proto.lower().strip()
+    port = normalize_port(port)
+    scope = scope.lower().strip()
+
+    if proto not in {"tcp", "udp"}:
+        return None
+
+    if scope not in {"public", "lan", "localhost"}:
+        return None
+
+    if not valid_port(port):
+        return None
+
+    return proto, port, scope
 
 def valid_ip_or_cidr(value: str) -> bool:
     if not value:
@@ -478,25 +516,70 @@ def handle(ctx: Ctx, job: dict) -> None:
         return
     if typ == "ufw_apply_ports":
         selected = payload.get("ports") or []
+
         if not isinstance(selected, list) or not selected:
             raise RuntimeError("Nic nebylo vybráno.")
+
         lan_net = str(payload.get("lan_net", "192.168.0.0/16")).strip()
-        scope = str(payload.get("scope", "auto")).strip()
+        scope = str(payload.get("scope", "auto")).strip().lower()
+
+        if scope not in {"auto", "public", "lan"}:
+            scope = "auto"
+
+        if lan_net and not valid_ip_or_cidr(lan_net):
+            raise RuntimeError(f"Neplatný LAN rozsah: {lan_net}")
+
         any_err = False
+        added = 0
+        skipped = 0
+
         for token in selected:
-            m = re.match(r"^(tcp|udp):(\d+):(public|lan|localhost)$", str(token))
-            if not m: continue
-            proto, port, klass = m.group(1), m.group(2), m.group(3)
+            parsed = parse_port_token(str(token))
+
+            if not parsed:
+                skipped += 1
+                ctx.job_log(job_id, f"SKIP neplatný token portu: {token}")
+                continue
+
+            proto, port, klass = parsed
+
             if klass == "localhost":
+                skipped += 1
                 ctx.job_log(job_id, f"SKIP localhost port {proto}/{port}")
                 continue
+
             final_scope = scope if scope in {"public", "lan"} else ("lan" if klass == "lan" else "public")
-            p = {"action": "allow", "dir": "in", "port": port, "proto": proto}
-            if final_scope == "lan": p["from"] = lan_net
-            rc, out = _run_ufw_rule(p)
-            ctx.job_log(job_id, f"{proto}/{port} {final_scope}: " + (out.strip() or f"exit={rc}"))
-            if rc != 0: any_err = True
-        if any_err: raise RuntimeError("Některá UFW pravidla se nepodařilo přidat. Viz log jobu.")
+
+            rule_payload = {
+                "action": "allow",
+                "dir": "in",
+                "port": port,
+                "proto": proto,
+                "comment": f"ORIS auto {klass} {proto}/{port}",
+            }
+
+            if final_scope == "lan":
+                rule_payload["from"] = lan_net
+
+            rc, out = _run_ufw_rule(rule_payload)
+
+            ctx.job_log(
+                job_id,
+                f"{proto}/{port} {final_scope}: " + (out.strip() or f"exit={rc}")
+            )
+
+            if rc != 0:
+                any_err = True
+            else:
+                added += 1
+
+        run(["ufw", "reload"], check=False)
+
+        ctx.job_log(job_id, f"UFW auto porty hotovo. Přidáno: {added}, přeskočeno: {skipped}")
+
+        if any_err:
+            raise RuntimeError("Některá UFW pravidla se nepodařilo přidat. Viz log jobu.")
+
         return
     if typ == "ufw_delete":
         num = str(payload.get("num", "")).strip()
