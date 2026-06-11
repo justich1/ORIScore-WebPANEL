@@ -143,45 +143,61 @@ def _mysql_maps(ctx: Ctx) -> None:
 
 
 def _write_dovecot_sql(ctx: Ctx) -> None:
-    cfg = _mail_db_cfg(ctx)
-    uid, gid = _vmail_ids()
-    vroot = ctx.setting('vmail_root', '/var/vmail').rstrip('/')
+    # Dovecot 2.4 nepoužívá staré passdb/userdb args přes dovecot-sql.conf.ext.
+    # SQL konfiguraci generujeme přímo do 99-oris-auth.conf.
+    old = Path("/etc/dovecot/dovecot-sql.conf.ext")
+    if old.exists():
+        disabled = Path("/etc/dovecot/dovecot-sql.conf.ext.disabled-oris")
+        if disabled.exists():
+            disabled.unlink()
+        old.rename(disabled)
 
-    content = f"""driver = mysql
-connect = host={cfg.get('host','127.0.0.1')} dbname={cfg.get('name','oris_mail')} user={cfg.get('user','oris_mail')} password={cfg.get('pass','')}
-default_pass_scheme = {ctx.setting('dovecot_hash_scheme','BLF-CRYPT')}
-password_query = SELECT email AS user, pass_hash AS password FROM mailboxes WHERE email='%u' AND is_active=1
-user_query = SELECT CONCAT('{vroot}/', SUBSTRING_INDEX(email, '@', -1), '/', local_part) AS home, {uid} AS uid, {gid} AS gid FROM mailboxes WHERE email='%u' AND is_active=1
-"""
-    atomic_write("/etc/dovecot/dovecot-sql.conf.ext", content, 0o640)
-    run(["chown", "root:dovecot", "/etc/dovecot/dovecot-sql.conf.ext"], check=False)
 
 def _write_dovecot(ctx: Ctx) -> None:
     vroot = ctx.setting("vmail_root", "/var/vmail").rstrip("/")
+    cfg = _mail_db_cfg(ctx)
+    scheme = ctx.setting("dovecot_hash_scheme", "BLF-CRYPT")
 
-    auth = f"""# ORIS virtual mail auth
+    db_host = str(cfg.get("host", "127.0.0.1"))
+    db_name = str(cfg.get("name", "oris_mail"))
+    db_user = str(cfg.get("user", "oris_mail"))
+    db_pass = str(cfg.get("pass", ""))
+
+    auth = f"""# ORIS virtual mail auth - Dovecot 2.4
+auth_mechanisms = plain login
+auth_allow_cleartext = yes
+
 mail_driver = maildir
-mail_path = {vroot}/%{{user|domain}}/%{{user|username}}
+mail_path = {vroot}/%{{user | domain}}/%{{user | username}}
 mail_uid = vmail
 mail_gid = mail
 mail_privileged_group = mail
 
-disable_plaintext_auth = no
-auth_mechanisms = plain login
+sql_driver = mysql
 
-passdb {{
-  driver = sql
-  args = /etc/dovecot/dovecot-sql.conf.ext
+mysql {db_host} {{
+  user = {db_user}
+  password = {db_pass}
+  dbname = {db_name}
 }}
 
-userdb {{
-  driver = sql
-  args = /etc/dovecot/dovecot-sql.conf.ext
+passdb sql {{
+  default_password_scheme = {scheme}
+  query = SELECT email AS user, pass_hash AS password FROM mailboxes WHERE email = '%{{user}}' AND is_active = 1
+}}
+
+userdb sql {{
+  query = SELECT CONCAT('{vroot}/', SUBSTRING_INDEX(email, '@', -1), '/', local_part) AS home FROM mailboxes WHERE email = '%{{user}}' AND is_active = 1
+  iterate_query = SELECT email AS user FROM mailboxes WHERE is_active = 1
 }}
 """
 
-    lmtp = """# ORIS Postfix integration
-protocols = imap lmtp sieve
+    lmtp = """# ORIS Postfix integration - Dovecot 2.4
+protocols {
+  imap = yes
+  lmtp = yes
+  sieve = yes
+}
 
 service lmtp {
   unix_listener /var/spool/postfix/private/dovecot-lmtp {
