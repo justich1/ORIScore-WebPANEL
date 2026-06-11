@@ -141,10 +141,22 @@ def _mysql_maps(ctx: Ctx) -> None:
         atomic_write(path, content, 0o640)
         run(["chown", "root:postfix", path], check=False)
 
+def _disable_dovecot_system_auth() -> None:
+    p = Path("/etc/dovecot/conf.d/10-auth.conf")
+    if not p.exists():
+        return
+
+    s = p.read_text(encoding="utf-8", errors="replace")
+    s2 = re.sub(
+        r"(?m)^[ \t]*!include[ \t]+auth-system\.conf\.ext[ \t]*$",
+        "# ORIS disabled system auth: !include auth-system.conf.ext",
+        s,
+    )
+
+    if s2 != s:
+        atomic_write(str(p), s2)
 
 def _write_dovecot_sql(ctx: Ctx) -> None:
-    # Dovecot 2.4 nepoužívá staré passdb/userdb args přes dovecot-sql.conf.ext.
-    # SQL konfiguraci generujeme přímo do 99-oris-auth.conf.
     old = Path("/etc/dovecot/dovecot-sql.conf.ext")
     if old.exists():
         disabled = Path("/etc/dovecot/dovecot-sql.conf.ext.disabled-oris")
@@ -216,6 +228,7 @@ service auth {
 }
 """
 
+    _disable_dovecot_system_auth()
     atomic_write("/etc/dovecot/conf.d/99-oris-auth.conf", auth)
     atomic_write("/etc/dovecot/conf.d/99-oris-lmtp.conf", lmtp)
     _write_dovecot_sql(ctx)
