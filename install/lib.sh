@@ -360,6 +360,11 @@ configure_mail_base() {
     useradd -r -u 5000 -g mail -d /var/vmail -s /usr/sbin/nologin vmail || true
   fi
 
+  if [ -e /var/spool/postfix/etc/resolv.conf ]; then
+    chown root:root /var/spool/postfix/etc/resolv.conf || true
+    chmod 644 /var/spool/postfix/etc/resolv.conf || true
+  fi
+
   chown -R vmail:mail /var/vmail
   chmod 770 /var/vmail
 
