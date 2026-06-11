@@ -134,6 +134,8 @@ install_packages() {
   echo "==> Instaluji systémové balíky"
   export DEBIAN_FRONTEND=noninteractive
 
+  configure_php82_repo
+
   apt-get update
 
   echo "postfix postfix/main_mailer_type select Internet Site" | debconf-set-selections || true
