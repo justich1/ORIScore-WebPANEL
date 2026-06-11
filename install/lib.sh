@@ -25,8 +25,6 @@ mysql_root() { mysql --protocol=socket -u root "$@"; }
 PANEL_PHP_SOCKET="/run/php/oris-panel.sock"
 
 php_socket() {
-  # Vrací skutečný systémový PHP-FPM socket, pokud existuje.
-  # Nepoužívat pro ORIS panel: panel má vlastní stabilní socket /run/php/oris-panel.sock.
   if [[ -S /run/php/php-fpm.sock ]]; then echo /run/php/php-fpm.sock; return; fi
   local s
   s="$(ls /run/php/php*-fpm.sock 2>/dev/null | sort -V | tail -n1 || true)"
@@ -42,7 +40,36 @@ php_fpm_version() {
     echo "$v"
     return 0
   fi
+
   php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;' 2>/dev/null || true
+}
+
+php_pkg() {
+  local ext="$1"
+  local version
+  version="$(php_fpm_version || true)"
+
+  if [[ -n "$version" ]] && apt-cache show "php${version}-${ext}" >/dev/null 2>&1; then
+    echo "php${version}-${ext}"
+    return 0
+  fi
+
+  if apt-cache show "php-${ext}" >/dev/null 2>&1; then
+    echo "php-${ext}"
+    return 0
+  fi
+
+  if apt-cache show "php${ext}" >/dev/null 2>&1; then
+    echo "php${ext}"
+    return 0
+  fi
+
+  return 1
+}
+
+php_optional_pkg() {
+  local ext="$1"
+  php_pkg "$ext" || true
 }
 
 ensure_panel_php_pool() {
@@ -91,15 +118,22 @@ EOF
 install_packages() {
   echo "==> Instaluji systémové balíky"
   export DEBIAN_FRONTEND=noninteractive
+
   apt-get update
+
   echo "postfix postfix/main_mailer_type select Internet Site" | debconf-set-selections || true
   echo "postfix postfix/mailname string localhost.localdomain" | debconf-set-selections || true
   echo "roundcube-core roundcube/dbconfig-install boolean false" | debconf-set-selections || true
   echo "phpmyadmin phpmyadmin/dbconfig-install boolean false" | debconf-set-selections || true
   echo "phpmyadmin phpmyadmin/reconfigure-webserver multiselect" | debconf-set-selections || true
+
+  local PHP_IMAP PHP_JSON
+  PHP_IMAP="$(php_optional_pkg imap)"
+  PHP_JSON="$(php_optional_pkg json)"
+
   apt-get install -y \
     nginx mariadb-server curl unzip zip rsync ca-certificates sudo cron logrotate \
-    php-fpm php-cli php-mysql php-curl php-mbstring php-xml php-zip php-gd php-intl php-imap php-bcmath php-readline php-json php-common \
+    php-fpm php-cli php-mysql php-curl php-mbstring php-xml php-zip php-gd php-intl ${PHP_IMAP} php-bcmath php-readline ${PHP_JSON} php-common \
     certbot openssl python3 python3-venv python3-pip python3-systemd \
     vsftpd lftp fail2ban ufw iptables rsyslog \
     wireguard wireguard-tools qrencode \
@@ -121,6 +155,7 @@ copy_ui() {
     --exclude='extras/oris-provisioner.php' \
     --exclude='extras/oris-stats-worker.php' \
     "$UI_SRC/" "$TARGET_UI/"
+
   chown -R www-data:www-data "$TARGET_UI"
   chmod -R u+rwX,g+rwX,o-rwx "$TARGET_UI"
   chmod 750 "$TARGET_UI"
@@ -133,10 +168,12 @@ copy_ui() {
 create_databases() {
   local panel_pass="$1"
   echo "==> Vytvářím databáze a DB uživatele"
+
   mysql_root <<SQL
 CREATE DATABASE IF NOT EXISTS oris_panel CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 CREATE DATABASE IF NOT EXISTS oris_mail CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 CREATE DATABASE IF NOT EXISTS roundcube CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+
 CREATE USER IF NOT EXISTS 'oris_panel'@'localhost' IDENTIFIED BY '${panel_pass}';
 CREATE USER IF NOT EXISTS 'oris_panel'@'127.0.0.1' IDENTIFIED BY '${panel_pass}';
 CREATE USER IF NOT EXISTS 'oris_mail'@'localhost' IDENTIFIED BY '${panel_pass}';
@@ -145,6 +182,7 @@ CREATE USER IF NOT EXISTS 'roundcube'@'localhost' IDENTIFIED BY '${panel_pass}';
 CREATE USER IF NOT EXISTS 'roundcube'@'127.0.0.1' IDENTIFIED BY '${panel_pass}';
 CREATE USER IF NOT EXISTS 'oris_admin'@'localhost' IDENTIFIED BY '${panel_pass}';
 CREATE USER IF NOT EXISTS 'oris_admin'@'127.0.0.1' IDENTIFIED BY '${panel_pass}';
+
 ALTER USER 'oris_panel'@'localhost' IDENTIFIED BY '${panel_pass}';
 ALTER USER 'oris_panel'@'127.0.0.1' IDENTIFIED BY '${panel_pass}';
 ALTER USER 'oris_mail'@'localhost' IDENTIFIED BY '${panel_pass}';
@@ -153,6 +191,7 @@ ALTER USER 'roundcube'@'localhost' IDENTIFIED BY '${panel_pass}';
 ALTER USER 'roundcube'@'127.0.0.1' IDENTIFIED BY '${panel_pass}';
 ALTER USER 'oris_admin'@'localhost' IDENTIFIED BY '${panel_pass}';
 ALTER USER 'oris_admin'@'127.0.0.1' IDENTIFIED BY '${panel_pass}';
+
 GRANT ALL PRIVILEGES ON oris_panel.* TO 'oris_panel'@'localhost';
 GRANT ALL PRIVILEGES ON oris_panel.* TO 'oris_panel'@'127.0.0.1';
 GRANT ALL PRIVILEGES ON oris_mail.* TO 'oris_mail'@'localhost';
@@ -161,6 +200,7 @@ GRANT ALL PRIVILEGES ON roundcube.* TO 'roundcube'@'localhost';
 GRANT ALL PRIVILEGES ON roundcube.* TO 'roundcube'@'127.0.0.1';
 GRANT ALL PRIVILEGES ON *.* TO 'oris_admin'@'localhost' WITH GRANT OPTION;
 GRANT ALL PRIVILEGES ON *.* TO 'oris_admin'@'127.0.0.1' WITH GRANT OPTION;
+
 FLUSH PRIVILEGES;
 SQL
 }
@@ -171,7 +211,6 @@ ensure_mail_database() {
   create_databases "$panel_pass"
 }
 
-
 run_schema() {
   echo "==> Inicializuji DB schema"
   mysql_root oris_panel < "$PROJECT_ROOT/sql/panel_schema.sql"
@@ -181,8 +220,10 @@ run_schema() {
 write_config_php() {
   local panel_pass="$1" admin_email="$2" admin_pass="$3"
   echo "==> Píšu config.php a admin účet"
+
   local admin_hash
   admin_hash="$(php -r 'echo password_hash($argv[1], PASSWORD_DEFAULT);' "$admin_pass")"
+
   cat > "$TARGET_UI/config.php" <<PHP
 <?php
 return [
@@ -193,26 +234,29 @@ return [
   'default_lang' => 'cs',
 ];
 PHP
+
   chown root:www-data "$TARGET_UI/config.php"
   chmod 0640 "$TARGET_UI/config.php"
+
   mysql_root oris_panel -e "INSERT INTO users(email,pass_hash,role,is_active) VALUES('${admin_email}', '${admin_hash}', 'admin', 1) ON DUPLICATE KEY UPDATE pass_hash=VALUES(pass_hash), role='admin', is_active=1;"
+
   touch "$TARGET_UI/install.lock"
   chown root:www-data "$TARGET_UI/install.lock"
   chmod 0640 "$TARGET_UI/install.lock"
 }
 
 configure_php_alias_socket() {
-  # Starý alias /run/php/php-fpm.sock se už pro panel nepoužívá.
-  # Panel má vlastní stabilní pool/socket, aby ho změny site poolů nerozbily.
   ensure_panel_php_pool
 }
 
 ensure_config_php_mail_db() {
   local panel_pass="$1"
   echo "==> Kontroluji mail_db v config.php"
+
   if [[ ! -f "$TARGET_UI/config.php" ]]; then
     return 0
   fi
+
   PANEL_PASS="$panel_pass" php <<'PHP'
 <?php
 $p = '/var/www/oris-panel/config.php';
@@ -222,6 +266,7 @@ $c['mail_db'] = ['host'=>'127.0.0.1','port'=>3306,'name'=>'oris_mail','user'=>'o
 $c['db_admin'] = $c['db_admin'] ?? ['user'=>'oris_admin','pass'=>$pass];
 file_put_contents($p, "<?php\nreturn " . var_export($c, true) . ";\n");
 PHP
+
   chown root:www-data "$TARGET_UI/config.php"
   chmod 0640 "$TARGET_UI/config.php"
 }
@@ -229,8 +274,14 @@ PHP
 configure_roundcube_base() {
   local panel_pass="$1"
   echo "==> Nastavuji Roundcube DB a základní konfiguraci"
+
   export DEBIAN_FRONTEND=noninteractive
-  apt-get install -y roundcube roundcube-core roundcube-mysql roundcube-plugins php-imap
+
+  local PHP_IMAP
+  PHP_IMAP="$(php_optional_pkg imap)"
+
+  apt-get install -y roundcube roundcube-core roundcube-mysql roundcube-plugins ${PHP_IMAP}
+
   mysql_root <<SQL
 CREATE DATABASE IF NOT EXISTS roundcube CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 CREATE USER IF NOT EXISTS 'roundcube'@'localhost' IDENTIFIED BY '${panel_pass}';
@@ -241,6 +292,7 @@ GRANT ALL PRIVILEGES ON roundcube.* TO 'roundcube'@'localhost';
 GRANT ALL PRIVILEGES ON roundcube.* TO 'roundcube'@'127.0.0.1';
 FLUSH PRIVILEGES;
 SQL
+
   if ! mysql_root roundcube -e "SHOW TABLES LIKE 'users';" | grep -q users; then
     for f in /usr/share/roundcube/SQL/mysql.initial.sql /var/lib/roundcube/SQL/mysql.initial.sql /usr/share/dbconfig-common/data/roundcube/install/mysql; do
       if [[ -f "$f" ]]; then
@@ -249,10 +301,13 @@ SQL
       fi
     done
   fi
+
   mkdir -p /etc/roundcube
+
   if [[ -f /etc/roundcube/config.inc.php ]]; then
     cp /etc/roundcube/config.inc.php /etc/roundcube/config.inc.php.oris.bak.$(date +%s) || true
   fi
+
   cat >/etc/roundcube/config.inc.php <<PHP
 <?php
 \$config = [];
@@ -269,6 +324,7 @@ SQL
 \$config['plugins'] = ['archive', 'zipdownload', 'markasjunk'];
 \$config['junk_mbox'] = 'Junk';
 PHP
+
   chown root:www-data /etc/roundcube/config.inc.php
   chmod 0640 /etc/roundcube/config.inc.php
 }
@@ -276,25 +332,33 @@ PHP
 configure_mail_base() {
   local panel_pass="$1"
   echo "==> Nastavuji základ mailserveru"
+
   export DEBIAN_FRONTEND=noninteractive
+
   apt-get install -y postfix postfix-mysql dovecot-core dovecot-imapd dovecot-lmtpd dovecot-mysql dovecot-sieve dovecot-managesieved rspamd redis-server swaks mailutils
+
   ensure_mail_database "$panel_pass"
   ensure_config_php_mail_db "$panel_pass"
   configure_roundcube_base "$panel_pass"
+
   mkdir -p /var/vmail /var/lib/rspamd/dkim /var/www/oris-mail-info /var/www/letsencrypt/.well-known/acme-challenge
+
   if ! id vmail >/dev/null 2>&1; then
     useradd -r -u 5000 -g mail -d /var/vmail -s /usr/sbin/nologin vmail || true
   fi
+
   chown -R vmail:mail /var/vmail
   chmod 770 /var/vmail
+
   chown -R _rspamd:_rspamd /var/lib/rspamd/dkim 2>/dev/null || true
   chmod 750 /var/lib/rspamd/dkim || true
+
   systemctl enable redis-server rspamd postfix dovecot || true
 }
 
-
 install_python_backend() {
   echo "==> Připravuji Python venv provisioner"
+
   cd "$PROJECT_ROOT"
   python3 -m venv "$PROJECT_ROOT/.venv"
   "$PROJECT_ROOT/.venv/bin/pip" install --upgrade pip wheel
@@ -304,8 +368,11 @@ install_python_backend() {
 write_python_config() {
   local panel_pass="$1"
   local certbot_email="${2:-}"
+
   echo "==> Píšu konfiguraci pro Python provisioner"
+
   mkdir -p /etc/oris-panel
+
   cat > /etc/oris-panel/provisioner.json <<JSON
 {
   "db": {"host": "127.0.0.1", "port": 3306, "name": "oris_panel", "user": "oris_panel", "pass": "$panel_pass"},
@@ -320,17 +387,23 @@ write_python_config() {
   }
 }
 JSON
+
   chown root:root /etc/oris-panel/provisioner.json
   chmod 0600 /etc/oris-panel/provisioner.json
+
   local certbot_email_sql
   certbot_email_sql=$(printf '%s' "$certbot_email" | sed "s/'/''/g")
+
   mysql_root oris_panel -e "INSERT INTO settings(k,v) VALUES('certbot_email','${certbot_email_sql}'),('acme_webroot','/var/www/letsencrypt'),('php_fpm_socket','/run/php/oris-panel.sock'),('web_root_bases','/var/www/sites\n/var/www/html\n/data/www'),('upload_staging_dir','/var/lib/oris-core/uploads') ON DUPLICATE KEY UPDATE v=VALUES(v); INSERT IGNORE INTO settings(k,v) VALUES('panel_access_mode','ip'),('panel_domain',''),('panel_force_https','0'),('panel_ssl_status','none'),('panel_ssl_last_error','');"
 }
 
 configure_vsftpd() {
   echo "==> Nastavuji vsftpd"
+
   grep -qxF /usr/sbin/nologin /etc/shells || echo /usr/sbin/nologin >> /etc/shells
+
   cp /etc/vsftpd.conf /etc/vsftpd.conf.oris.bak.$(date +%s) 2>/dev/null || true
+
   cat > /etc/vsftpd.conf <<'VFTP'
 listen=YES
 listen_ipv6=NO
@@ -346,28 +419,33 @@ pasv_min_port=40000
 pasv_max_port=40100
 seccomp_sandbox=NO
 VFTP
+
   systemctl enable --now vsftpd
   systemctl restart vsftpd
 }
 
 configure_sudoers() {
   echo "==> Nastavuji sudoers pro panel"
+
   cat > /etc/sudoers.d/oris-panel <<'SUD'
 Defaults:www-data !requiretty
 
-# Bezpečné čtení logů: PHP smí volat jen whitelist wrapper, ne libovolný journalctl/tail.
 www-data ALL=(root) NOPASSWD: /var/www/oris-panel/extras/oris-log *
 
 SUD
+
   chmod 0440 /etc/sudoers.d/oris-panel
   visudo -cf /etc/sudoers.d/oris-panel
 }
 
 install_phpmyadmin_nginx() {
   echo "==> Nastavuji phpMyAdmin Nginx snippet"
+
   export DEBIAN_FRONTEND=noninteractive
   apt-get install -y phpmyadmin
+
   mkdir -p /etc/nginx/snippets
+
   cat > /etc/nginx/snippets/phpmyadmin.conf <<'NGINX'
 location = /phpmyadmin {
     return 301 /phpmyadmin/;
@@ -394,12 +472,32 @@ location ~* ^/phpmyadmin/(.+\.(jpg|jpeg|gif|css|png|js|ico|html|xml|txt|svg|woff
     access_log off;
 }
 NGINX
+
   if [[ ! -d /usr/share/phpmyadmin || ! -f /usr/share/phpmyadmin/index.php ]]; then
     echo "ERROR: phpMyAdmin není dostupný v /usr/share/phpmyadmin" >&2
     exit 1
   fi
 }
 
+configure_fail2ban_whitelist() {
+  echo "==> Nastavuji Fail2ban whitelist"
+
+  mkdir -p /etc/fail2ban/jail.d
+
+  local ignoreip="127.0.0.1/8 ::1"
+  ignoreip="$ignoreip 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16"
+
+  if [ -n "${ORIS_FAIL2BAN_IGNOREIP:-}" ]; then
+    ignoreip="$ignoreip $ORIS_FAIL2BAN_IGNOREIP"
+  fi
+
+  cat >/etc/fail2ban/jail.d/00-oris-whitelist.local <<EOF
+[DEFAULT]
+ignoreip = $ignoreip
+EOF
+
+  chmod 644 /etc/fail2ban/jail.d/00-oris-whitelist.local
+}
 
 configure_fail2ban_base() {
   echo "==> Nastavuji Fail2ban základ + permanentní bany"
@@ -415,17 +513,14 @@ configure_fail2ban_base() {
 
   configure_fail2ban_whitelist
 
-  # Log pro ruční/permanentní bany z ORIS panelu
   touch /var/log/oris-security.log
   chmod 640 /var/log/oris-security.log
   chown root:adm /var/log/oris-security.log || true
 
-  # Některé Debian instalace nemají /var/log/fail2ban.log hned vytvořený.
   touch /var/log/fail2ban.log
   chmod 640 /var/log/fail2ban.log
   chown root:adm /var/log/fail2ban.log || true
 
-  # SSH jail přes systemd backend, aby to nepadalo na chybějící auth.log.
   cat >/etc/fail2ban/jail.d/00-oris-sshd.local <<'EOF'
 [sshd]
 enabled = true
@@ -436,7 +531,6 @@ findtime = 600
 bantime = 3600
 EOF
 
-  # Ruční permanentní ban z panelu.
   cat >/etc/fail2ban/filter.d/oris-perm.conf <<'EOF'
 [Definition]
 failregex = ^.*ORIS-PERM-BAN <HOST>.*$
@@ -455,8 +549,6 @@ maxretry = 1
 action = iptables-allports[name=oris-perm]
 EOF
 
-  # Automatický permanentní ban po opakovaných banech.
-  # Výchozí: 5 banů za 7 dní => permanentní ban.
   cat >/etc/fail2ban/jail.d/oris-recidive.local <<'EOF'
 [recidive]
 enabled = true
@@ -475,47 +567,22 @@ EOF
   systemctl restart fail2ban
 }
 
-configure_fail2ban_whitelist() {
-    echo "==> Nastavuji Fail2ban whitelist"
-
-    mkdir -p /etc/fail2ban/jail.d
-
-    # Základní whitelist:
-    # - localhost
-    # - privátní LAN rozsahy
-    # - IP nového proxy/serveru lze doplnit přes ORIS_FAIL2BAN_IGNOREIP
-    local ignoreip="127.0.0.1/8 ::1"
-
-    # Volitelné rozsahy LAN/VPN — nechávám rozumně bezpečné.
-    ignoreip="$ignoreip 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16"
-
-    # Pokud je v prostředí zadaná další IP / rozsahy, přidají se.
-    # Např. ORIS_FAIL2BAN_IGNOREIP="89.221.216.232 10.42.0.0/24"
-    if [ -n "${ORIS_FAIL2BAN_IGNOREIP:-}" ]; then
-        ignoreip="$ignoreip $ORIS_FAIL2BAN_IGNOREIP"
-    fi
-
-    cat >/etc/fail2ban/jail.d/00-oris-whitelist.local <<EOF
-[DEFAULT]
-ignoreip = $ignoreip
-EOF
-
-    chmod 644 /etc/fail2ban/jail.d/00-oris-whitelist.local
-}
-
 install_security_base() {
   echo "==> Nastavuji základ Security Center"
+
   export DEBIAN_FRONTEND=noninteractive
+
   apt-get install -y ufw fail2ban python3-systemd rsyslog iptables
+
   systemctl enable --now rsyslog || true
+
   mkdir -p /etc/nginx/conf.d /etc/nginx/snippets /etc/fail2ban/filter.d /etc/fail2ban/jail.d /var/log/nginx
+
   touch /var/log/nginx/access.log /var/log/nginx/error.log /var/log/fail2ban.log /var/log/oris-security.log
   chmod 640 /var/log/fail2ban.log /var/log/oris-security.log || true
   chown root:adm /var/log/fail2ban.log /var/log/oris-security.log || true
 
   cat > /etc/nginx/conf.d/oris-security-zones.conf <<'NGINX'
-# ORIS Security Center - global zones
-# Generated by installer/provisioner. Do not edit manually.
 limit_req_zone $binary_remote_addr zone=oris_req:20m rate=10r/s;
 limit_conn_zone $binary_remote_addr zone=oris_conn:20m;
 NGINX
@@ -538,9 +605,7 @@ failregex = ^<HOST> - .* "(?:GET|POST|HEAD) .*(?:wp-login\.php|xmlrpc\.php|\.env
 ignoreregex =
 EOF
 
-  # ORIS web jaily. SSH/permanent/recidive zapisuje configure_fail2ban_base níže.
   cat > /etc/fail2ban/jail.d/oris-security.conf <<'EOF'
-# ORIS Security Center - web jails
 [oris-nginx-phpmyadmin]
 enabled = true
 filter = oris-nginx-phpmyadmin
@@ -560,12 +625,12 @@ findtime = 600
 bantime = 3600
 EOF
 
-  # Permanentní jail + recidive jsou vždy součást základu.
   configure_fail2ban_base
 }
 
 run_stats_once() {
   echo "==> Jednorázově aktualizuji monitoring cache"
+
   if [[ -x "$PROJECT_ROOT/.venv/bin/python" && -d "$PROJECT_ROOT/backend/oris_provisioner" ]]; then
     (cd "$PROJECT_ROOT/backend" && PYTHONPATH="$PROJECT_ROOT/backend" "$PROJECT_ROOT/.venv/bin/python" -m oris_provisioner.stats_worker --once) || true
   else
@@ -575,11 +640,10 @@ run_stats_once() {
 
 add_phpmyadmin_include_to_vhosts() {
   echo "==> Kontroluji phpMyAdmin include v existujících webových vhostech"
+
   for f in /etc/nginx/sites-available/*.conf; do
     [[ -f "$f" ]] || continue
 
-    # Reverse proxy vhosty phpMyAdmin obsahovat nemají. Pokud tam include z dřívějška je,
-    # odstraníme ho, aby /phpmyadmin/ na proxy doméně nelezlo do lokální administrace.
     if grep -q "proxy_pass " "$f"; then
       if grep -q "snippets/phpmyadmin.conf" "$f"; then
         sed -i '/snippets\/phpmyadmin\.conf/d' "$f"
@@ -594,11 +658,12 @@ add_phpmyadmin_include_to_vhosts() {
       echo "OK phpMyAdmin už je ve vhostu: $f"
       continue
     fi
+
     if grep -q "location .*phpmyadmin" "$f"; then
-      echo "SKIP: $f obsahuje starý ruční phpMyAdmin location blok. Nepřidávám include, aby nevznikl duplicate location."
+      echo "SKIP: $f obsahuje starý ruční phpMyAdmin location blok."
       continue
     fi
-    # Přidáváme jen include do panelu a běžných webových vhostů, nikdy do proxy.
+
     sed -i '/server_name .*;/a\    include snippets/phpmyadmin.conf;' "$f"
     echo "Přidáno: $f"
   done
@@ -606,15 +671,12 @@ add_phpmyadmin_include_to_vhosts() {
 
 write_panel_nginx() {
   echo "==> Nastavuji Nginx vhost panelu"
+
   mkdir -p /var/www/letsencrypt/.well-known/acme-challenge
   chown -R www-data:www-data /var/www/letsencrypt
+
   ensure_panel_php_pool
 
-  # Preferuj Python generátor panelového vhostu, protože umí režim:
-  # - jen IP
-  # - IP + admin doména
-  # - jen admin doména
-  # a případně HTTPS certifikát pro administraci.
   if [[ -x "$PROJECT_ROOT/.venv/bin/python" && -f "$PROJECT_ROOT/backend/oris_provisioner/plugins/panel.py" && -f /etc/oris-panel/provisioner.json ]]; then
     ORIS_PROVISIONER_CONFIG=/etc/oris-panel/provisioner.json \
     PYTHONPATH="$PROJECT_ROOT/backend" \
@@ -623,16 +685,17 @@ from oris_provisioner.common import load_config
 from oris_provisioner.main import connect
 from oris_provisioner.context import Ctx
 from oris_provisioner.plugins.panel import write_panel_vhost
+
 cfg = load_config()
 conn = connect(cfg["db"], True)
 write_panel_vhost(Ctx(cfg, conn))
 conn.close()
 PYPANEL
+
     rm -f /etc/nginx/sites-enabled/default
     return
   fi
 
-  # Fallback pro nouzový zápis, kdyby Python ještě nebyl dostupný.
   cat > /etc/nginx/sites-available/oris-panel.conf <<'NGINX'
 server {
     listen 80 default_server;
@@ -666,12 +729,14 @@ server {
     }
 }
 NGINX
+
   ln -sfn /etc/nginx/sites-available/oris-panel.conf /etc/nginx/sites-enabled/oris-panel.conf
   rm -f /etc/nginx/sites-enabled/default
 }
 
 write_services() {
   echo "==> Instaluji systemd služby pro Python provisioner"
+
   cat > /etc/systemd/system/oris-provisioner.service <<UNIT
 [Unit]
 Description=ORIS Queue MVP Python provisioner
@@ -709,22 +774,29 @@ RestartSec=3
 [Install]
 WantedBy=multi-user.target
 UNIT
+
   systemctl daemon-reload
 }
 
 start_services() {
   echo "==> Spouštím služby"
+
   systemctl enable --now nginx mariadb cron vsftpd
   systemctl restart nginx vsftpd
+
   systemctl enable --now oris-provisioner oris-stats-worker
   systemctl restart oris-provisioner oris-stats-worker
 }
 
 repair_nginx_php_socket() {
-  # Opravuje jen panel a phpMyAdmin snippet. Běžné weby mají vlastní oris-site-X.sock.
   ensure_panel_php_pool
+
   local sock="$PANEL_PHP_SOCKET"
-  for f in     /etc/nginx/sites-available/oris-panel.conf     /etc/nginx/sites-enabled/oris-panel.conf     /etc/nginx/snippets/phpmyadmin.conf
+
+  for f in \
+    /etc/nginx/sites-available/oris-panel.conf \
+    /etc/nginx/sites-enabled/oris-panel.conf \
+    /etc/nginx/snippets/phpmyadmin.conf
   do
     [[ -e "$f" ]] || continue
     sed -i -E "s#unix:/run/php/php[0-9.]+-fpm.sock#unix:${sock}#g; s#unix:/run/php/php-fpm.sock#unix:${sock}#g" "$f"
@@ -732,21 +804,21 @@ repair_nginx_php_socket() {
 }
 
 configure_python_work_dirs() {
-    echo "==> Připravuji pracovní adresáře pro Python provisioner"
+  echo "==> Připravuji pracovní adresáře pro Python provisioner"
 
-    mkdir -p \
-      /var/lib/oris-core/uploads/mail \
-      /var/lib/oris-core/uploads/servercfg \
-      /var/lib/oris-core/uploads/site-backup \
-      /var/lib/oris-core/backups/mail \
-      /var/lib/oris-core/backups/rspamd \
-      /var/lib/oris-core/backups/servercfg
+  mkdir -p \
+    /var/lib/oris-core/uploads/mail \
+    /var/lib/oris-core/uploads/servercfg \
+    /var/lib/oris-core/uploads/site-backup \
+    /var/lib/oris-core/backups/mail \
+    /var/lib/oris-core/backups/rspamd \
+    /var/lib/oris-core/backups/servercfg
 
-    chown -R www-data:www-data \
-      /var/lib/oris-core/uploads \
-      /var/lib/oris-core/backups
+  chown -R www-data:www-data \
+    /var/lib/oris-core/uploads \
+    /var/lib/oris-core/backups
 
-    chmod -R 770 \
-      /var/lib/oris-core/uploads \
-      /var/lib/oris-core/backups
+  chmod -R 770 \
+    /var/lib/oris-core/uploads \
+    /var/lib/oris-core/backups
 }
