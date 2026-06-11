@@ -115,6 +115,21 @@ EOF
   systemctl restart "$unit" || systemctl reload "$unit" || true
 }
 
+configure_php82_repo() {
+  echo "==> Přidávám SURY PHP repo pro PHP 8.2"
+
+  apt-get update
+  apt-get install -y lsb-release ca-certificates curl gnupg
+
+  curl -sSLo /tmp/debsuryorg-archive-keyring.deb https://packages.sury.org/debsuryorg-archive-keyring.deb
+  dpkg -i /tmp/debsuryorg-archive-keyring.deb
+
+  echo "deb [signed-by=/usr/share/keyrings/debsuryorg-archive-keyring.gpg] https://packages.sury.org/php/ $(lsb_release -sc) main" \
+    > /etc/apt/sources.list.d/php.list
+
+  apt-get update
+}
+
 install_packages() {
   echo "==> Instaluji systémové balíky"
   export DEBIAN_FRONTEND=noninteractive
