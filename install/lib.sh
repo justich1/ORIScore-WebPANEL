@@ -127,13 +127,9 @@ install_packages() {
   echo "phpmyadmin phpmyadmin/dbconfig-install boolean false" | debconf-set-selections || true
   echo "phpmyadmin phpmyadmin/reconfigure-webserver multiselect" | debconf-set-selections || true
 
-  local PHP_IMAP PHP_JSON
-  PHP_IMAP="$(php_optional_pkg imap)"
-  PHP_JSON="$(php_optional_pkg json)"
-
   apt-get install -y \
     nginx mariadb-server curl unzip zip rsync ca-certificates sudo cron logrotate \
-    php-fpm php-cli php-mysql php-curl php-mbstring php-xml php-zip php-gd php-intl ${PHP_IMAP} php-bcmath php-readline ${PHP_JSON} php-common \
+    php8.2-fpm php8.2-cli php8.2-mysql php8.2-curl php8.2-mbstring php8.2-xml php8.2-zip php8.2-gd php8.2-intl php8.2-imap php8.2-bcmath php8.2-readline php8.2-common \
     certbot openssl python3 python3-venv python3-pip python3-systemd \
     vsftpd lftp fail2ban ufw iptables rsyslog \
     wireguard wireguard-tools qrencode \
