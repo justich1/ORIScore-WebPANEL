@@ -407,7 +407,7 @@ JSON
   local certbot_email_sql
   certbot_email_sql=$(printf '%s' "$certbot_email" | sed "s/'/''/g")
 
-  mysql_root oris_panel -e "INSERT INTO settings(k,v) VALUES('certbot_email','${certbot_email_sql}'),('acme_webroot','/var/www/letsencrypt'),('php_fpm_socket','/run/php/oris-panel.sock'),('web_root_bases','/var/www/sites\n/var/www/html\n/data/www'),('upload_staging_dir','/var/lib/oris-core/uploads') ON DUPLICATE KEY UPDATE v=VALUES(v); INSERT IGNORE INTO settings(k,v) VALUES('panel_access_mode','ip'),('panel_domain',''),('panel_force_https','0'),('panel_ssl_status','none'),('panel_ssl_last_error','');"
+  mysql_root oris_panel -e "INSERT INTO settings(k,v) VALUES('certbot_email','${certbot_email_sql}'),('acme_webroot','/var/www/letsencrypt'),('php_fpm_socket','/run/php/oris-panel.sock'),('web_root_bases','/var/www/sites'),('upload_staging_dir','/var/lib/oris-core/uploads') ON DUPLICATE KEY UPDATE v=VALUES(v); INSERT IGNORE INTO settings(k,v) VALUES('panel_access_mode','ip'),('panel_domain',''),('panel_force_https','0'),('panel_ssl_status','none'),('panel_ssl_last_error','');"
 }
 
 configure_vsftpd() {
