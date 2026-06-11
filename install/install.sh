@@ -61,7 +61,5 @@ echo
 echo "Hotovo."
 echo "Panel:       http://IP_SERVERU/"
 echo "phpMyAdmin:  http://IP_SERVERU/phpmyadmin/"
-echo "Certbot:     http://IP_SERVERU/admin/certbot.php"
 echo "Login:       $ADMIN_EMAIL"
-echo
-echo "Reálné joby: web, DB, FTP, Certbot, WireGuard, Mail/Roundcube/DKIM. Ostatní joby jsou zatím bezpečné stuby."
+
