@@ -258,9 +258,20 @@ Instalátor provede zejména:
 
 Po instalaci vypíše adresu panelu, phpMyAdmin a přihlašovací e-mail.
 
-## Upgrade
+### Upgrade na poslední verzi z GitHubu
+
+> Pozor: tento postup přepíše lokální změny v repozitáři podle větve `main`.
 
 ```bash
+cd /opt/oris_webserver
+git fetch --all
+git reset --hard origin/main
+git clean -fdn
+git clean -fd
+sudo chmod +x install/install.sh
+sudo chmod +x install/repair.sh
+sudo chmod +x install/upgrade.sh
+sudo chmod +x install/lib.sh
 sudo bash install/upgrade.sh
 ```
 
