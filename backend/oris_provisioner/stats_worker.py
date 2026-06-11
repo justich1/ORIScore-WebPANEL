@@ -140,7 +140,7 @@ def write_stats(api_dir: Path):
 
 
 def main():
-    api_dir = Path(os.environ.get("ORIS_STATS_API_DIR", "/var/www/oris-panel/admin/api"))
+    api_dir = Path(os.environ.get("ORIS_STATS_API_DIR", "/var/www/oris-panel/api"))
     interval = max(1, min(30, int(os.environ.get("ORIS_STATS_INTERVAL", "2"))))
     once = "--once" in os.sys.argv
     while True:
