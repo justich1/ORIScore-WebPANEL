@@ -448,8 +448,16 @@ configure_sudoers() {
   cat > /etc/sudoers.d/oris-panel <<'SUD'
 Defaults:www-data !requiretty
 
+# ORIS log wrapper
 www-data ALL=(root) NOPASSWD: /var/www/oris-panel/extras/oris-log *
 
+# Security Center - read-only status commands
+www-data ALL=(root) NOPASSWD: /usr/bin/systemctl is-active *
+www-data ALL=(root) NOPASSWD: /usr/sbin/ufw status numbered
+www-data ALL=(root) NOPASSWD: /usr/bin/fail2ban-client status
+www-data ALL=(root) NOPASSWD: /usr/bin/fail2ban-client status *
+www-data ALL=(root) NOPASSWD: /usr/bin/journalctl -u ssh -u fail2ban -n 40 --no-pager
+www-data ALL=(root) NOPASSWD: /usr/bin/tail -n 40 /var/log/nginx/error.log
 SUD
 
   chmod 0440 /etc/sudoers.d/oris-panel
