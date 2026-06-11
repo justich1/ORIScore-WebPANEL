@@ -100,7 +100,7 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
 }
 
 $vals=[]; foreach($settingsDefaults as $k=>$def) $vals[$k]=first_nonempty_setting($pdo,$k,$def);
-$services = ['nginx','mariadb','php-fpm','vsftpd','fail2ban','ufw','oris-provisioner','oris-stats-worker'];
+$services = ['nginx','mariadb','php8.2-fpm','vsftpd','fail2ban','ufw','oris-provisioner','oris-stats-worker'];
 $svcStates=[]; foreach($services as $s) $svcStates[$s]=svc_state($s);
 $ufwStatus = shx('sudo /usr/sbin/ufw status numbered');
 $f2bStatus = shx('sudo /usr/bin/fail2ban-client status');
