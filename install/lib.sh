@@ -777,7 +777,7 @@ After=network.target
 [Service]
 Type=simple
 WorkingDirectory=$PROJECT_ROOT/backend
-Environment=ORIS_STATS_API_DIR=/var/www/oris-panel/admin/api
+Environment=ORIS_STATS_API_DIR=/var/www/oris-panel/api
 Environment=ORIS_STATS_INTERVAL=2
 Environment=PYTHONPATH=$PROJECT_ROOT/backend
 ExecStart=$PROJECT_ROOT/.venv/bin/python -m oris_provisioner.stats_worker
