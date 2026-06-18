@@ -130,6 +130,99 @@ configure_php82_repo() {
   apt-get update
 }
 
+configure_dovecot_lmtp_user_mask() {
+  echo "==> Nastavuji Dovecot LMTP username masku"
+
+  if [[ -f /etc/dovecot/conf.d/20-lmtp.conf ]]; then
+    cp -a /etc/dovecot/conf.d/20-lmtp.conf /etc/dovecot/conf.d/20-lmtp.conf.oris.bak.$(date +%s) || true
+
+    if grep -qE '^[[:space:]]*auth_username_format' /etc/dovecot/conf.d/20-lmtp.conf; then
+      sed -i -E 's#^[[:space:]]*auth_username_format[[:space:]]*=.*#  auth_username_format = %{user | lower}#' /etc/dovecot/conf.d/20-lmtp.conf
+    else
+      sed -i '/protocol lmtp {/a\  auth_username_format = %{user | lower}' /etc/dovecot/conf.d/20-lmtp.conf
+    fi
+  fi
+}
+
+configure_dovecot_postfix_auth_socket() {
+  echo "==> Nastavuji Dovecot auth socket pro Postfix"
+
+  cat > /etc/dovecot/conf.d/99-oris-postfix-auth.conf <<'EOF'
+# ORIS - Postfix SMTP AUTH přes Dovecot
+service auth {
+  unix_listener /var/spool/postfix/private/auth {
+    mode = 0660
+    user = postfix
+    group = postfix
+  }
+}
+EOF
+}
+
+configure_postfix_submission() {
+  echo "==> Nastavuji Postfix submission 587 + STARTTLS"
+
+  local master="/etc/postfix/master.cf"
+  local mailname cert key n
+
+  [[ -f "$master" ]] || return 0
+  cp -a "$master" "$master.oris.bak.$(date +%s)" || true
+
+  postconf -e "smtpd_sasl_auth_enable=yes"
+  postconf -e "smtpd_sasl_type=dovecot"
+  postconf -e "smtpd_sasl_path=private/auth"
+  postconf -e "smtpd_tls_auth_only=yes"
+  postconf -e "smtpd_tls_security_level=may"
+  postconf -e "smtpd_relay_restrictions=permit_mynetworks,permit_sasl_authenticated,defer_unauth_destination"
+
+  mailname="$(postconf -h myhostname 2>/dev/null || true)"
+
+  for n in "$mailname" "$(cat /etc/mailname 2>/dev/null || true)" "$(hostname -f 2>/dev/null || true)"; do
+    [[ -n "$n" ]] || continue
+    cert="/etc/letsencrypt/live/${n}/fullchain.pem"
+    key="/etc/letsencrypt/live/${n}/privkey.pem"
+
+    if [[ -f "$cert" && -f "$key" ]]; then
+      postconf -e "smtpd_tls_cert_file=${cert}"
+      postconf -e "smtpd_tls_key_file=${key}"
+      break
+    fi
+  done
+
+  if [[ -z "$(postconf -h smtpd_tls_cert_file 2>/dev/null || true)" ]]; then
+    if [[ -f /etc/ssl/certs/ssl-cert-snakeoil.pem && -f /etc/ssl/private/ssl-cert-snakeoil.key ]]; then
+      postconf -e "smtpd_tls_cert_file=/etc/ssl/certs/ssl-cert-snakeoil.pem"
+      postconf -e "smtpd_tls_key_file=/etc/ssl/private/ssl-cert-snakeoil.key"
+    fi
+  fi
+
+  if ! grep -qE '^submission[[:space:]]+inet[[:space:]]' "$master"; then
+    cat >> "$master" <<'EOF'
+
+# ORIS - SMTP submission pro mail klienty / aplikace
+submission inet n       -       y       -       -       smtpd
+  -o syslog_name=postfix/submission
+  -o smtpd_tls_security_level=encrypt
+  -o smtpd_sasl_auth_enable=yes
+  -o smtpd_client_restrictions=permit_sasl_authenticated,reject
+  -o smtpd_recipient_restrictions=permit_sasl_authenticated,reject
+  -o smtpd_relay_restrictions=permit_sasl_authenticated,reject
+EOF
+  fi
+
+  postfix check
+}
+
+configure_mail_firewall_ports() {
+  echo "==> Povoluji mail porty ve firewallu"
+
+  if command -v ufw >/dev/null 2>&1; then
+    ufw allow 25/tcp || true
+    ufw allow 587/tcp || true
+    ufw allow 993/tcp || true
+  fi
+}
+
 install_packages() {
   echo "==> Instaluji systémové balíky"
   export DEBIAN_FRONTEND=noninteractive
@@ -147,7 +240,7 @@ install_packages() {
   apt-get install -y \
     nginx mariadb-server curl unzip zip rsync ca-certificates sudo cron logrotate \
     php8.2-fpm php8.2-cli php8.2-mysql php8.2-curl php8.2-mbstring php8.2-xml php8.2-zip php8.2-gd php8.2-intl php8.2-imap php8.2-bcmath php8.2-readline php8.2-common \
-    certbot openssl python3 python3-venv python3-pip python3-systemd \
+    certbot openssl ssl-cert python3 python3-venv python3-pip python3-systemd \
     vsftpd lftp fail2ban ufw iptables rsyslog \
     wireguard wireguard-tools qrencode \
     postfix postfix-mysql dovecot-core dovecot-imapd dovecot-lmtpd dovecot-mysql dovecot-sieve dovecot-managesieved \
@@ -370,6 +463,15 @@ configure_mail_base() {
 
   chown -R _rspamd:_rspamd /var/lib/rspamd/dkim 2>/dev/null || true
   chmod 750 /var/lib/rspamd/dkim || true
+
+  configure_dovecot_lmtp_user_mask
+  configure_dovecot_postfix_auth_socket
+  configure_postfix_submission
+  configure_mail_firewall_ports
+
+  doveconf -n >/dev/null
+  systemctl enable redis-server rspamd postfix dovecot || true
+  systemctl restart dovecot postfix || true
 
   systemctl enable redis-server rspamd postfix dovecot || true
 }
