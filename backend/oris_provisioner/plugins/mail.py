@@ -13,6 +13,7 @@ import pwd
 import socket
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 import pymysql
 from pymysql.cursors import DictCursor
@@ -164,6 +165,58 @@ def _write_dovecot_sql(ctx: Ctx) -> None:
             disabled.unlink()
         old.rename(disabled)
 
+def _disable_dovecot_bad_lmtp_user_mask() -> None:
+    """
+    Debian/Dovecot může mít v 20-lmtp.conf:
+      auth_username_format = %{user | username | lower}
+
+    To je pro virtuální schránky špatně, protože to z adresy
+    user@domain.cz udělá jen user. LMTP pak hlásí User doesn't exist.
+    """
+    p = Path("/etc/dovecot/conf.d/20-lmtp.conf")
+    if not p.exists():
+        return
+
+    s = p.read_text(encoding="utf-8", errors="replace")
+    s2 = re.sub(
+        r"(?m)^([ \t]*)auth_username_format[ \t]*=.*$",
+        r"\1# ORIS disabled bad LMTP mask: auth_username_format = %{user | username | lower}",
+        s,
+    )
+
+    if s2 != s:
+        atomic_write(str(p), s2)
+
+
+def _ensure_postfix_submission() -> None:
+    """
+    Zapne port 587 pro externí klienty.
+    Globálně je SMTP AUTH vypnutý na portu 25,
+    ale tady se na 587 zapne přes master.cf.
+    """
+    p = Path("/etc/postfix/master.cf")
+    if not p.exists():
+        return
+
+    s = p.read_text(encoding="utf-8", errors="replace")
+
+    if re.search(r"(?m)^submission[ \t]+inet[ \t]+", s):
+        return
+
+    block = """
+
+# ORIS - SMTP submission pro mail klienty / aplikace
+submission inet n       -       y       -       -       smtpd
+  -o syslog_name=postfix/submission
+  -o smtpd_tls_security_level=encrypt
+  -o smtpd_sasl_auth_enable=yes
+  -o smtpd_client_restrictions=permit_sasl_authenticated,reject
+  -o smtpd_recipient_restrictions=permit_sasl_authenticated,reject
+  -o smtpd_relay_restrictions=permit_sasl_authenticated,reject
+"""
+
+    atomic_write(str(p), s.rstrip() + block + "\n", 0o644)
+
 
 def _write_dovecot(ctx: Ctx) -> None:
     vroot = ctx.setting("vmail_root", "/var/vmail").rstrip("/")
@@ -180,7 +233,9 @@ auth_mechanisms = plain login
 auth_allow_cleartext = yes
 
 mail_driver = maildir
+mail_home = {vroot}/%{{user | domain}}/%{{user | username}}
 mail_path = {vroot}/%{{user | domain}}/%{{user | username}}
+mail_inbox_path = {vroot}/%{{user | domain}}/%{{user | username}}
 mail_uid = vmail
 mail_gid = mail
 mail_privileged_group = mail
@@ -195,11 +250,11 @@ mysql {db_host} {{
 
 passdb sql {{
   default_password_scheme = {scheme}
-  query = SELECT email AS user, pass_hash AS password FROM mailboxes WHERE email = '%{{user}}' AND is_active = 1
+  query = SELECT email AS user, pass_hash AS password FROM mailboxes WHERE LOWER(email) = LOWER('%{{user}}') AND is_active = 1
 }}
 
 userdb sql {{
-  query = SELECT CONCAT('{vroot}/', SUBSTRING_INDEX(email, '@', -1), '/', local_part) AS home FROM mailboxes WHERE email = '%{{user}}' AND is_active = 1
+  query = SELECT CONCAT('{vroot}/', SUBSTRING_INDEX(email, '@', -1), '/', local_part) AS home FROM mailboxes WHERE LOWER(email) = LOWER('%{{user}}') AND is_active = 1
   iterate_query = SELECT email AS user FROM mailboxes WHERE is_active = 1
 }}
 """
@@ -209,6 +264,10 @@ protocols {
   imap = yes
   lmtp = yes
   sieve = yes
+}
+
+protocol lmtp {
+  auth_username_format = %{user | lower}
 }
 
 service lmtp {
@@ -229,8 +288,11 @@ service auth {
 """
 
     _disable_dovecot_system_auth()
+    _disable_dovecot_bad_lmtp_user_mask()
+
     atomic_write("/etc/dovecot/conf.d/99-oris-auth.conf", auth)
     atomic_write("/etc/dovecot/conf.d/99-oris-lmtp.conf", lmtp)
+
     _write_dovecot_sql(ctx)
 
 
@@ -363,8 +425,10 @@ def _write_postfix(ctx: Ctx) -> None:
         "virtual_gid_maps": f"static:{gid}",
         "smtpd_sasl_type": "dovecot",
         "smtpd_sasl_path": "private/auth",
-        "smtpd_sasl_auth_enable": "yes",
+        "smtpd_sasl_auth_enable": "no",
         "smtpd_tls_security_level": "may",
+        "smtpd_tls_auth_only": "yes",
+        "smtpd_relay_restrictions": "permit_mynetworks,permit_sasl_authenticated,defer_unauth_destination",
         "smtpd_tls_cert_file": tls_cert,
         "smtpd_tls_key_file": tls_key,
         "smtpd_milters": f"inet:{milter}",
@@ -380,6 +444,8 @@ def _write_postfix(ctx: Ctx) -> None:
     for k, v in settings.items():
         _postconf(k, v)
 
+    _ensure_postfix_submission()
+
 
 def _roundcube_root() -> str:
     for p in ["/var/lib/roundcube/public_html", "/var/lib/roundcube", "/usr/share/roundcube"]:
@@ -390,30 +456,45 @@ def _roundcube_root() -> str:
 
 def _write_roundcube_config(ctx: Ctx) -> None:
     cfg = ctx.cfg.get("roundcube_db") or {}
-    pw = cfg.get("pass", "")
-    db = cfg.get("name", "roundcube")
-    user = cfg.get("user", "roundcube")
+    pw = str(cfg.get("pass", ""))
+    db = str(cfg.get("name", "roundcube"))
+    user = str(cfg.get("user", "roundcube"))
+
+    pw_url = quote(pw, safe="")
+
     junk = ctx.setting("mail.roundcube.junk_mbox", "Junk")
     plugins = "['archive', 'zipdownload', 'markasjunk']" if _setting_bool(ctx, "mail.roundcube.enabled", True) else "['archive', 'zipdownload']"
+
     des = ctx.setting("roundcube_des_key", "")
     if not des:
         import secrets, string
         chars = string.ascii_letters + string.digits
-        des = "".join(secrets.choice(chars) for _ in range(24))
+        des = "".join(secrets.choice(chars) for _ in range(32))
         ctx.set_setting("roundcube_des_key", des)
+
     content = f"""<?php
 $config = [];
-$config['db_dsnw'] = 'mysql://{user}:{pw}@localhost/{db}';
 
-// IMAP na lokálním Dovecotu. Ponecháváme staré i nové názvy voleb kvůli kompatibilitě Debian/Roundcube balíků.
-$config['imap_host'] = 'localhost:143';
+$config['db_dsnw'] = 'mysql://{user}:{pw_url}@localhost/{db}';
+
 $config['default_host'] = 'localhost';
 $config['default_port'] = 143;
 
-// SMTP přes lokální Postfix bez SMTP autentizace. Roundcube běží na stejném serveru.
-$config['smtp_host'] = '127.0.0.1:25';
+/*
+ * Roundcube běží lokálně na serveru.
+ * SMTP AUTH tady nepoužíváme.
+ * Lokální odesílání jde přes 127.0.0.1:25 bez přihlášení.
+ * SMTP AUTH necháváme jen pro externí klienty na portu 587 STARTTLS.
+ */
+
+/* Starší Roundcube klíče */
 $config['smtp_server'] = '127.0.0.1';
 $config['smtp_port'] = 25;
+
+/* Novější Roundcube klíč */
+$config['smtp_host'] = '127.0.0.1:25';
+
+/* Vynuceně bez SMTP autentizace */
 $config['smtp_user'] = '';
 $config['smtp_pass'] = '';
 $config['smtp_auth_type'] = null;
@@ -421,10 +502,18 @@ $config['smtp_auth_type'] = null;
 $config['support_url'] = '';
 $config['product_name'] = 'ORIS Webmail';
 $config['des_key'] = '{des}';
+
 $config['plugins'] = {plugins};
+
+$config['sent_mbox'] = 'Sent';
+$config['drafts_mbox'] = 'Drafts';
+$config['trash_mbox'] = 'Trash';
 $config['junk_mbox'] = '{junk}';
+$config['create_default_folders'] = true;
+
 $config['default_folders'] = ['INBOX', 'Drafts', 'Sent', '{junk}', 'Trash', 'Archive'];
 """
+
     atomic_write("/etc/roundcube/config.inc.php", content, 0o640)
     run(["chown", "root:www-data", "/etc/roundcube/config.inc.php"], check=False)
 
