@@ -414,21 +414,39 @@ SQL
     cp /etc/roundcube/config.inc.php /etc/roundcube/config.inc.php.oris.bak.$(date +%s) || true
   fi
 
+local roundcube_db_pass_url
+roundcube_db_pass_url="$(php -r 'echo rawurlencode($argv[1]);' "$panel_pass")"
+
   cat >/etc/roundcube/config.inc.php <<PHP
 <?php
 \$config = [];
-\$config['db_dsnw'] = 'mysql://roundcube:${panel_pass}@localhost/roundcube';
+
+\$config['db_dsnw'] = 'mysql://roundcube:${roundcube_db_pass_url}@localhost/roundcube';
+
 \$config['default_host'] = 'localhost';
 \$config['default_port'] = 143;
-\$config['smtp_server'] = 'localhost';
+
+/*
+ * Roundcube běží lokálně na serveru.
+ * SMTP AUTH tady nepoužíváme, posílá se přes localhost/127.0.0.1:25.
+ * SMTP AUTH necháváme pro externí klienty na portu 587.
+ */
+\$config['smtp_server'] = '127.0.0.1';
 \$config['smtp_port'] = 25;
-\$config['smtp_user'] = '%u';
-\$config['smtp_pass'] = '%p';
+\$config['smtp_user'] = '';
+\$config['smtp_pass'] = '';
+
 \$config['support_url'] = '';
 \$config['product_name'] = 'ORIS Webmail';
 \$config['des_key'] = '$(randpass)';
+
 \$config['plugins'] = ['archive', 'zipdownload', 'markasjunk'];
+
+\$config['sent_mbox'] = 'Sent';
+\$config['drafts_mbox'] = 'Drafts';
+\$config['trash_mbox'] = 'Trash';
 \$config['junk_mbox'] = 'Junk';
+\$config['create_default_folders'] = true;
 PHP
 
   chown root:www-data /etc/roundcube/config.inc.php
