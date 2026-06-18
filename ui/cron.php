@@ -65,7 +65,7 @@ if($_SERVER['REQUEST_METHOD']==='POST'){
             ->execute([$siteId,$name,$schedule,$cmd,$runAs,$enabled]);
       }
       $pdo->prepare("INSERT INTO jobs(type,ref_id,status,payload) VALUES('cron_apply',?, 'queued', JSON_OBJECT('action','apply'))")->execute([$siteId]);
-      flash_set('ok', t('cron.flash.saved_queued', [], 'Cron uložen a zařazen do fronty.'));
+      flash_set('ok', $cid>0 ? t('cron.flash.updated_queued', [], 'Cron upraven a konfigurace bude přegenerována.') : t('cron.flash.saved_queued', [], 'Cron uložen a zařazen do fronty.'));
     }
     if(isset($_POST['delete_job'])){
       $cid=(int)($_POST['cron_id'] ?? 0);
@@ -83,13 +83,18 @@ if($_SERVER['REQUEST_METHOD']==='POST'){
 }
 
 $rows=[];
+$editId=(int)($_GET['edit_id'] ?? 0);
+$editRow=null;
 if($selected){
   $st=$pdo->prepare("SELECT * FROM cron_jobs WHERE site_id=? ORDER BY id DESC"); $st->execute([$siteId]); $rows=$st->fetchAll(PDO::FETCH_ASSOC);
+  if($editId>0){
+    $st=$pdo->prepare("SELECT * FROM cron_jobs WHERE id=? AND site_id=? LIMIT 1"); $st->execute([$editId,$siteId]); $editRow=$st->fetch(PDO::FETCH_ASSOC) ?: null;
+  }
 }
 $last=$pdo->query("SELECT * FROM jobs WHERE type IN ('cron_apply','cron_run') ORDER BY id DESC LIMIT 1")->fetch();
 
-render($pdo, t('page.cron.title', [], 'Cron'), function() use ($sites,$siteId,$selected,$rows,$last){ ?>
-  <style>.rowgrid{display:grid;grid-template-columns:1fr 1fr 2fr auto;gap:10px;align-items:end}.rowgrid input,.rowgrid select{width:100%}@media(max-width:900px){.rowgrid{grid-template-columns:1fr}}</style>
+render($pdo, t('page.cron.title', [], 'Cron'), function() use ($sites,$siteId,$selected,$rows,$last,$editRow){ ?>
+  <style>.rowgrid{display:grid;grid-template-columns:1fr 1fr 2fr auto;gap:10px;align-items:end}.rowgrid input,.rowgrid select{width:100%}.cron-actions{display:grid;gap:6px;margin:0}.cron-actions .btn2,.cron-actions .btn-danger{width:100%;box-sizing:border-box;text-align:center}@media(max-width:900px){.rowgrid{grid-template-columns:1fr}}</style>
   <div class="card">
     <h2><?=h(t('cron.heading', [], 'Cron pro web'))?></h2>
     <small><?=h(t('cron.intro', [], 'Cron zapisuje Python provisioner do /etc/cron.d/oris-sites. Samotné běhy prochází přes Python runner, který ukládá poslední výstup a exit code.'))?></small>
@@ -105,23 +110,25 @@ render($pdo, t('page.cron.title', [], 'Cron'), function() use ($sites,$siteId,$s
     <?php if($selected): ?><small><?=h(t('common.root', [], 'Kořen'))?>: <code><?=h($selected['root_path'])?></code></small><?php endif; ?>
   </div>
   <?php if($selected): ?>
-  <div class="card">
-    <h3><?=h(t('cron.new.heading', [], 'Nový cron'))?></h3>
+  <div class="card" id="cron-form">
+    <h3><?=h($editRow ? t('cron.edit.heading', [], 'Upravit cron') : t('cron.new.heading', [], 'Nový cron'))?></h3>
+    <?php if($editRow): ?><small><?=h(t('cron.edit.intro', [], 'Upravuješ existující úlohu. Po uložení se systémový cron přegeneruje.'))?></small><?php endif; ?>
     <form method="post" style="display:grid;gap:12px">
       <input type="hidden" name="_csrf" value="<?=h(csrf_token())?>"><input type="hidden" name="site_id" value="<?=h($siteId)?>">
+      <?php if($editRow): ?><input type="hidden" name="cron_id" value="<?=h($editRow['id'])?>"><?php endif; ?>
       <div class="grid2">
-        <label><?=h(t('common.name', [], 'Název'))?><br><input name="name" value="<?=h(t('cron.default.task_name', [], 'Úloha'))?>"></label>
-        <label><?=h(t('cron.form.linux_user', [], 'Linux uživatel'))?><br><input name="run_as" value="www-data"></label>
+        <label><?=h(t('common.name', [], 'Název'))?><br><input name="name" value="<?=h($editRow['name'] ?? t('cron.default.task_name', [], 'Úloha'))?>"></label>
+        <label><?=h(t('cron.form.linux_user', [], 'Linux uživatel'))?><br><input name="run_as" value="<?=h($editRow['run_as'] ?? 'www-data')?>"></label>
       </div>
       <div class="grid2">
         <label><?=h(t('cron.form.mode', [], 'Režim'))?><br><select name="mode">
-          <option value="every"><?=h(t('cron.mode.every', [], 'Každých N minut'))?></option>
+          <option value="every" <?=(!$editRow?'selected':'')?>><?=h(t('cron.mode.every', [], 'Každých N minut'))?></option>
           <option value="daily"><?=h(t('cron.mode.daily', [], 'Denně'))?></option>
           <option value="weekly"><?=h(t('cron.mode.weekly', [], 'Týdně'))?></option>
           <option value="monthly"><?=h(t('cron.mode.monthly', [], 'Měsíčně'))?></option>
-          <option value="advanced"><?=h(t('cron.mode.advanced', [], 'Pokročilý cron výraz'))?></option>
+          <option value="advanced" <?=($editRow?'selected':'')?>><?=h(t('cron.mode.advanced', [], 'Pokročilý cron výraz'))?></option>
         </select></label>
-        <label><?=h(t('cron.form.advanced_expression', [], 'Pokročilý výraz'))?><br><input name="schedule" placeholder="*/5 * * * *"></label>
+        <label><?=h(t('cron.form.advanced_expression', [], 'Pokročilý výraz'))?><br><input name="schedule" placeholder="*/5 * * * *" value="<?=h($editRow['schedule'] ?? '')?>"></label>
         <label><?=h(t('cron.form.every_minutes', [], 'Každých minut'))?><br><input name="every_minutes" value="5"></label>
         <label><?=h(t('cron.form.daily_at', [], 'Denně v'))?><br><input name="daily_time" value="02:00"></label>
         <label><?=h(t('cron.form.weekly_day', [], 'Týdenní den 0-7'))?><br><input name="weekly_day" value="1"></label>
@@ -129,9 +136,12 @@ render($pdo, t('page.cron.title', [], 'Cron'), function() use ($sites,$siteId,$s
         <label><?=h(t('cron.form.monthly_day', [], 'Den v měsíci 1-28'))?><br><input name="monthly_day" value="1"></label>
         <label><?=h(t('cron.form.monthly_at', [], 'Měsíčně v'))?><br><input name="monthly_time" value="02:00"></label>
       </div>
-      <label><?=h(t('cron.form.command', [], 'Příkaz'))?><br><input name="command" placeholder="php public/index.php cron/run" required></label>
-      <label><input type="checkbox" name="enabled" value="1" checked> <?=h(t('common.enable', [], 'Povolit'))?></label>
-      <button class="btn" name="save_job" value="1"><?=h(t('cron.action.save', [], 'Uložit cron'))?></button>
+      <label><?=h(t('cron.form.command', [], 'Příkaz'))?><br><input name="command" placeholder="php public/index.php cron/run" value="<?=h($editRow['command'] ?? '')?>" required></label>
+      <label><input type="checkbox" name="enabled" value="1" <?=(!$editRow || (int)$editRow['enabled']===1 ? 'checked' : '')?>> <?=h(t('common.enable', [], 'Povolit'))?></label>
+      <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
+        <button class="btn" name="save_job" value="1"><?=h($editRow ? t('cron.action.update', [], 'Uložit změny') : t('cron.action.save', [], 'Uložit cron'))?></button>
+        <?php if($editRow): ?><a class="btn2" href="/cron.php?site_id=<?=h($siteId)?>"><?=h(t('common.cancel', [], 'Zrušit'))?></a><?php endif; ?>
+      </div>
     </form>
   </div>
   <div class="card"><h3><?=h(t('cron.jobs.heading', [], 'Úlohy'))?></h3>
@@ -148,7 +158,7 @@ render($pdo, t('page.cron.title', [], 'Cron'), function() use ($sites,$siteId,$s
       <td><?=h($r['name'])?></td><td><code><?=h($r['schedule'])?></code><br><small><?=h($r['run_as'] ?: 'www-data')?></small></td><td><code><?=h($r['command'])?></code></td>
       <td><span class="pill <?=((int)$r['enabled']?'ok':'run')?>"><?=((int)$r['enabled'] ? h(t('common.status.enabled', [], 'povoleno')) : h(t('common.status.disabled', [], 'vypnuto')))?></span></td>
       <td><small><?=h($r['last_run_at'] ?: '—')?> / <?=h(t('cron.table.exit_code', [], 'návratový kód'))?> <?=h($r['last_exit_code'] ?? '—')?></small><?php if($r['last_output']): ?><pre><?=h(mb_substr((string)$r['last_output'],0,1000))?></pre><?php endif; ?></td>
-      <td><form method="post" style="display:grid;gap:6px;margin:0"><input type="hidden" name="_csrf" value="<?=h(csrf_token())?>"><input type="hidden" name="site_id" value="<?=h($siteId)?>"><input type="hidden" name="cron_id" value="<?=h($r['id'])?>"><button class="btn2" name="run_now" value="1"><?=h(t('common.run', [], 'Spustit'))?></button><button class="btn-danger" name="delete_job" value="1" onclick="return confirm(<?=h(json_encode(t('cron.confirm.delete', [], 'Smazat cron?'), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES))?>)"><?=h(t('common.delete', [], 'Smazat'))?></button></form></td>
+      <td><div class="cron-actions"><a class="btn2" href="/cron.php?site_id=<?=h($siteId)?>&edit_id=<?=h($r['id'])?>#cron-form"><?=h(t('common.edit', [], 'Upravit'))?></a><form method="post" class="cron-actions"><input type="hidden" name="_csrf" value="<?=h(csrf_token())?>"><input type="hidden" name="site_id" value="<?=h($siteId)?>"><input type="hidden" name="cron_id" value="<?=h($r['id'])?>"><button class="btn2" name="run_now" value="1"><?=h(t('common.run', [], 'Spustit'))?></button><button class="btn-danger" name="delete_job" value="1" onclick="return confirm(<?=h(json_encode(t('cron.confirm.delete', [], 'Smazat cron?'), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES))?>)"><?=h(t('common.delete', [], 'Smazat'))?></button></form></div></td>
     </tr><?php endforeach; ?></table></div><?php endif; ?>
   </div>
   <?php endif; ?>
