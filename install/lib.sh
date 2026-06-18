@@ -168,11 +168,16 @@ configure_postfix_submission() {
   [[ -f "$master" ]] || return 0
   cp -a "$master" "$master.oris.bak.$(date +%s)" || true
 
-  postconf -e "smtpd_sasl_auth_enable=yes"
+  # Globálně na portu 25 SMTP AUTH vypneme.
+  # AUTH má být zapnutý jen na submission portu 587 přes master.cf.
+  postconf -e "smtpd_sasl_auth_enable=no"
   postconf -e "smtpd_sasl_type=dovecot"
   postconf -e "smtpd_sasl_path=private/auth"
-  postconf -e "smtpd_tls_auth_only=yes"
+
+  # Port 25: STARTTLS volitelné, ne povinné.
+  # Díky tomu může Roundcube lokálně posílat přes 127.0.0.1:25 bez TLS/AUTH.
   postconf -e "smtpd_tls_security_level=may"
+  postconf -e "smtpd_tls_auth_only=yes"
   postconf -e "smtpd_relay_restrictions=permit_mynetworks,permit_sasl_authenticated,defer_unauth_destination"
 
   mailname="$(postconf -h myhostname 2>/dev/null || true)"
@@ -414,8 +419,8 @@ SQL
     cp /etc/roundcube/config.inc.php /etc/roundcube/config.inc.php.oris.bak.$(date +%s) || true
   fi
 
-local roundcube_db_pass_url
-roundcube_db_pass_url="$(php -r 'echo rawurlencode($argv[1]);' "$panel_pass")"
+  local roundcube_db_pass_url
+  roundcube_db_pass_url="$(php -r 'echo rawurlencode($argv[1]);' "$panel_pass")"
 
   cat >/etc/roundcube/config.inc.php <<PHP
 <?php
@@ -428,13 +433,22 @@ roundcube_db_pass_url="$(php -r 'echo rawurlencode($argv[1]);' "$panel_pass")"
 
 /*
  * Roundcube běží lokálně na serveru.
- * SMTP AUTH tady nepoužíváme, posílá se přes localhost/127.0.0.1:25.
- * SMTP AUTH necháváme pro externí klienty na portu 587.
+ * SMTP AUTH tady nepoužíváme.
+ * Lokální odesílání jde přes 127.0.0.1:25 bez přihlášení.
+ * SMTP AUTH necháváme jen pro externí klienty na portu 587 STARTTLS.
  */
+
+/* Starší Roundcube klíče */
 \$config['smtp_server'] = '127.0.0.1';
 \$config['smtp_port'] = 25;
+
+/* Novější Roundcube klíč */
+\$config['smtp_host'] = '127.0.0.1:25';
+
+/* Vynuceně bez SMTP autentizace */
 \$config['smtp_user'] = '';
 \$config['smtp_pass'] = '';
+\$config['smtp_auth_type'] = null;
 
 \$config['support_url'] = '';
 \$config['product_name'] = 'ORIS Webmail';
